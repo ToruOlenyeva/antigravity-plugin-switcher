@@ -6,6 +6,8 @@ This document details the core architecture, four-tier project resolution algori
 
 ## 1. System Architecture and Runtime Model
 
+This extension operates within the <b>Google Antigravity 2.0</b> desktop client environment (featuring the left-hand project and conversation tree <code>projects</code>, central conversation canvas, and the right-hand <code>SIDECAR_UI_ENTRYPOINT_AUX_PANE</code> container, distinguished from legacy VS Code-forked <code>Antigravity IDE</code>).
+
 Antigravity Plugin Switcher consists of two core components working in tandem:
 - <b>Hook Interceptor (auto-switch.cjs)</b>: Operates as an Antigravity lifecycle hook, intercepting workspace environment variables and session events.
 - <b>Sidecar Daemon (main.mjs + index.html)</b>: Operates as an isolated Node.js microservice and web dashboard, providing real-time management on port 8088 and within the Auxiliary Pane.

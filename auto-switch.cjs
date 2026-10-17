@@ -341,6 +341,7 @@ async function main() {
       }
       let profileChanged = false;
       for (const [pluginDir, pluginCfg] of Object.entries(configObj.plugins)) {
+        if (pluginDir.startsWith(".")) continue;
         if (PROTECTED_PLUGINS.has(pluginDir)) continue;
         const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
         if (matchedProfile.plugins[pluginDir] !== enabledInConfig) {
@@ -362,6 +363,7 @@ async function main() {
     const rpcUpdates = {};
 
     for (const [pluginDir, shouldEnable] of Object.entries(matchedProfile.plugins)) {
+      if (pluginDir.startsWith(".")) continue;
       if (PROTECTED_PLUGINS.has(pluginDir)) continue;
 
       if (!configObj.plugins[pluginDir]) configObj.plugins[pluginDir] = {};

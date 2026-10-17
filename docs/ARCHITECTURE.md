@@ -6,6 +6,8 @@
 
 ## 1. 核心架构与运行模型
 
+本扩展运行于 <b>Google Antigravity 2.0</b> 桌面客户端环境（基于左侧项目与会话树 <code>projects</code>、中央对话画布以及右侧 <code>SIDECAR_UI_ENTRYPOINT_AUX_PANE</code> 辅助面板容器，区别于早期基于 VS Code 分支的传统 <code>Antigravity IDE</code>）。
+
 Plugin Switcher 由两大协同组件构成：
 - <b>Hook 路由拦截器（auto-switch.cjs）</b>：作为 Antigravity 宿主预处理 Hook，在会话生命周期事件触发时运行，拦截并分发项目环境变量。
 - <b>Sidecar 常驻服务（main.mjs + index.html）</b>：作为独立 Node.js 常驻微服务与可视化前端，通过 8088 端口与辅助栏（Auxiliary Pane）提供实时操控能力。

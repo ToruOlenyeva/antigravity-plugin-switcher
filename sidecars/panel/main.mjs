@@ -22,6 +22,18 @@ const DEFAULT_KEY = "__default__";
 
 const PRELOAD_SDK_PATH = path.join(homeDir, ".gemini", "antigravity", "lib", "node_modules", "sidecar_sdk", "preload.js");
 
+function isValidPluginDirectory(dirName) {
+  if (!dirName || dirName.startsWith(".")) return false;
+  const fullDir = path.join(PLUGINS_DIR, dirName);
+  const candidates = [
+    path.join(fullDir, "plugin.json"),
+    path.join(fullDir, ".antigravity-plugin", "plugin.json"),
+    path.join(fullDir, ".gemini-plugin", "plugin.json"),
+    path.join(fullDir, ".claude-plugin", "plugin.json")
+  ];
+  return candidates.some((p) => fs.existsSync(p));
+}
+
 let sqliteDb = null;
 try {
   const { DatabaseSync } = await import("node:sqlite");
@@ -517,7 +529,7 @@ function getSystemState(query = {}) {
     const initialDefaultPlugins = {};
     if (fs.existsSync(PLUGINS_DIR)) {
       for (const entry of fs.readdirSync(PLUGINS_DIR, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
+        if (entry.isDirectory() && isValidPluginDirectory(entry.name)) {
           initialDefaultPlugins[entry.name] = (config.plugins?.[entry.name]?.enabled !== false);
         }
       }
@@ -578,14 +590,37 @@ function getSystemState(query = {}) {
     }
   }
 
+  // 自动清理 .git 隐藏目录残留键
+  if (config.plugins && config.plugins[".git"]) {
+    delete config.plugins[".git"];
+    writeJsonSafe(CONFIG_FILE, config);
+  }
+  for (const prof of Object.values(profiles)) {
+    if (prof && prof.plugins && prof.plugins[".git"] !== undefined) {
+      delete prof.plugins[".git"];
+      profilesModified = true;
+    }
+  }
+
   const installedPlugins = [];
   if (fs.existsSync(PLUGINS_DIR)) {
     const entries = fs.readdirSync(PLUGINS_DIR, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.isDirectory()) {
+      if (entry.isDirectory() && isValidPluginDirectory(entry.name)) {
         const dir = entry.name;
-        const manifestPath = path.join(PLUGINS_DIR, dir, "plugin.json");
-        const manifest = readJsonSafe(manifestPath, {});
+        let manifest = {};
+        const candidateManifests = [
+          path.join(PLUGINS_DIR, dir, "plugin.json"),
+          path.join(PLUGINS_DIR, dir, ".antigravity-plugin", "plugin.json"),
+          path.join(PLUGINS_DIR, dir, ".gemini-plugin", "plugin.json"),
+          path.join(PLUGINS_DIR, dir, ".claude-plugin", "plugin.json")
+        ];
+        for (const mPath of candidateManifests) {
+          if (fs.existsSync(mPath)) {
+            manifest = readJsonSafe(mPath, {});
+            break;
+          }
+        }
         const configEntry = (config.plugins && config.plugins[dir]) || {};
         const isEnabled = configEntry.enabled !== false;
 
