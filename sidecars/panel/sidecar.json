@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": [
+    "main.mjs"
+  ],
+  "restart_policy": "always",
+  "display_name": "项目插件独立开关",
+  "has_web_ui": true,
+  "ui_config": {
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "项目插件开关"
+      }
+    ]
+  }
+}

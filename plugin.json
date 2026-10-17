@@ -1,0 +1,20 @@
+{
+  "name": "plugin-switcher",
+  "displayName": "项目插件独立开关管理器",
+  "description": "按项目独立配置与切换 Antigravity 插件启用状态，提供辅助侧边栏可视化 Web 交互面板。",
+  "version": "1.0.0",
+  "author": {
+    "name": "Toru Olenyeva",
+    "url": "https://github.com/ToruOlenyeva"
+  },
+  "repository": "https://github.com/ToruOlenyeva/antigravity-plugin-switcher",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "plugin",
+    "switcher",
+    "workspace",
+    "profile",
+    "sidecar"
+  ]
+}

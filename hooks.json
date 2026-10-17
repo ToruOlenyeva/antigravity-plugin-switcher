@@ -1,0 +1,11 @@
+{
+  "plugin-switcher": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node auto-switch.cjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "__meta__": {
+    "version": 1,
+    "lastActiveProjectId": "__default__"
+  },
+  "__default__": {
+    "name": "Default Profile",
+    "plugins": {
+      "chrome-devtools-plugin": true,
+      "modern-web-guidance-plugin": true,
+      "plugin-switcher": true
+    }
+  },
+  "sample-web-project-id": {
+    "name": "My Web Project",
+    "paths": [
+      "/path/to/my-web-project"
+    ],
+    "plugins": {
+      "chrome-devtools-plugin": true,
+      "modern-web-guidance-plugin": true,
+      "plugin-switcher": true
+    }
+  },
+  "sample-backend-project-id": {
+    "name": "My Backend Project",
+    "paths": [
+      "/path/to/my-backend-project"
+    ],
+    "plugins": {
+      "chrome-devtools-plugin": false,
+      "modern-web-guidance-plugin": false,
+      "plugin-switcher": true
+    }
+  }
+}
