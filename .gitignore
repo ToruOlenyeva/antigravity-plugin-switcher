@@ -1,0 +1,8 @@
+node_modules/
+project-plugin-profiles.json
+.DS_Store
+Thumbs.db
+thumbs.db
+.idea/
+.vscode/
+clean-topology-tab.cjs
