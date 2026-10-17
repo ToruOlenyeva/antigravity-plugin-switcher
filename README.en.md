@@ -3,10 +3,10 @@
 # Antigravity Plugin Switcher
 
 <p align="left">
-  <img src="https://img.shields.io/badge/Google%20Antigravity-Plugin-blue?style=flat-square" alt="Antigravity Plugin" />
-  <img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-green?style=flat-square" alt="Node Version" />
-  <img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" />
-  <img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="License" />
+  <a href="https://antigravity.google/"><img src="https://img.shields.io/badge/Google%20Antigravity-Plugin-4285F4?style=flat-square&logo=google&logoColor=white" alt="Google Antigravity Plugin" /></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" /></a>
+  <a href="docs/ARCHITECTURE.en.md"><img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="MIT License" /></a>
 </p>
 
 > <b>Eliminate plugin bloat and context pollution</b>: Solve the critical issue where Google Antigravity shares a single global <code>config.json</code> across all projects and chat sessions, wasting context window and tokens. Tailor a dedicated plugin environment for every workspace.

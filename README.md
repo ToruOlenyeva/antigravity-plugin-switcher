@@ -3,10 +3,10 @@
 # Antigravity Plugin Switcher
 
 <p align="left">
-  <img src="https://img.shields.io/badge/Google%20Antigravity-Plugin-blue?style=flat-square" alt="Antigravity Plugin" />
-  <img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-green?style=flat-square" alt="Node Version" />
-  <img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" />
-  <img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="License" />
+  <a href="https://antigravity.google/"><img src="https://img.shields.io/badge/Google%20Antigravity-Plugin-4285F4?style=flat-square&logo=google&logoColor=white" alt="Google Antigravity Plugin" /></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" /></a>
+  <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="MIT License" /></a>
 </p>
 
 > <b>告别插件冗余与上下文污染</b>：解决 Google Antigravity 全局共用单一 <code>config.json</code> 导致不同项目与纯聊天会话间插件互相干扰、浪费 Token 与上下文窗口的痛点。为每个项目打造专属的插件运行环境。
