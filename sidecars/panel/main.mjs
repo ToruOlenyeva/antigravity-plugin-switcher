@@ -189,27 +189,34 @@ function scanAntigravityProjects() {
     orderArray = JSON.parse(appStorage.projectsOrder || "[]");
   } catch (e) {}
 
-  const orderMap = new Map();
-  orderArray.forEach((id, index) => {
-    orderMap.set(id, index);
-  });
-  const lastCreatedId = appStorage.lastCreatedProjectId || "";
+  let storageOrderModified = false;
 
-  // 2. 读取 projects 目录下全部项目配置
+  // 2. 读取 projects 目录下全部项目配置，并自动物理清除宿主生成的伴生空壳项目
   try {
     const files = fs.readdirSync(PROJECTS_DIR);
     for (const f of files) {
       if (!f.endsWith(".json") || f === "outside-of-project.json") continue;
       const fullPath = path.join(PROJECTS_DIR, f);
       const data = readJsonSafe(fullPath, null);
-      if (!data || !data.id || data.archived === true || data.isArchived === true) continue;
-      // 严密过滤内部伴生容器与自动化虚拟项目（严禁污染业务工程下拉菜单）
-      if (
+      if (!data || !data.id) continue;
+
+      const isGhostSidecarProject =
         sidecarProjectIds.has(data.id) ||
-        (data.name && (data.name.startsWith("plugin-") || data.name.includes("/sidecars/") || data.name.includes("/panel") || data.name.includes("/")))
-      ) {
+        (data.name && (data.name.startsWith("plugin-") || data.name.includes("/sidecars/") || data.name.includes("/panel") || data.name.includes("/")));
+
+      if (isGhostSidecarProject) {
+        // 自动物理删除宿主为 Sidecar 生成的伴生空壳项目文件，防止污染宿主原生侧边栏与设置页
+        try {
+          fs.unlinkSync(fullPath);
+        } catch (e) {}
+        if (orderArray.includes(data.id)) {
+          orderArray = orderArray.filter(id => id !== data.id);
+          storageOrderModified = true;
+        }
         continue;
       }
+
+      if (data.archived === true || data.isArchived === true) continue;
 
       const id = data.id;
       const name = data.name || id;
@@ -238,6 +245,17 @@ function scanAntigravityProjects() {
       });
     }
   } catch (e) {}
+
+  if (storageOrderModified) {
+    appStorage.projectsOrder = JSON.stringify(orderArray);
+    writeJsonSafe(APP_STORAGE_FILE, appStorage);
+  }
+
+  const orderMap = new Map();
+  orderArray.forEach((id, index) => {
+    orderMap.set(id, index);
+  });
+  const lastCreatedId = appStorage.lastCreatedProjectId || "";
 
   // 3. 严格按侧边栏拖拽顺序排序
   projectList.sort((a, b) => {
@@ -1304,10 +1322,17 @@ async function requestHandler(req, res) {
   res.end("Not Found");
 }
 
-const server = http.createServer(requestHandler);
+try {
+  scanAntigravityProjects();
+} catch (e) {}
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[PluginSwitcher Sidecar] Listening on http://0.0.0.0:${PORT} (Antigravity Port: ${process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || "custom"})`);
+const server = http.createServer(requestHandler);
+server.on("error", (err) => {
+  console.log(`[PluginSwitcher Sidecar] Primary port ${PORT} listener notice: ${err.message}`);
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`[PluginSwitcher Sidecar] Listening on http://127.0.0.1:${PORT} (Antigravity Port: ${process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || "custom"})`);
 });
 
 if (PORT !== 8088) {
