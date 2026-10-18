@@ -168,15 +168,30 @@ async function main() {
       return reply({});
     }
 
-    // 1. 构建包含 ~/.gemini/config/projects 与 profiles 的完整项目列表（含权威 paths 与 isPureChat）
+    // 1. 构建包含 ~/.gemini/config/projects 与 profiles 的完整项目列表（自动清除伴生容器空壳项目）
+    let rawConfigForSidecars = {};
+    try { rawConfigForSidecars = JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch (e) {}
+    const sidecarProjIds = new Set();
+    if (rawConfigForSidecars && rawConfigForSidecars.sidecars && typeof rawConfigForSidecars.sidecars === "object") {
+      for (const sc of Object.values(rawConfigForSidecars.sidecars)) {
+        if (sc && sc.projectId) sidecarProjIds.add(sc.projectId);
+      }
+    }
+
     const projList = [];
     const seenProjIds = new Set();
     try {
       if (fs.existsSync(projectsDir)) {
         for (const f of fs.readdirSync(projectsDir)) {
           if (!f.endsWith(".json") || f === "outside-of-project.json") continue;
-          const pData = JSON.parse(fs.readFileSync(path.join(projectsDir, f), "utf-8"));
+          const fullProjPath = path.join(projectsDir, f);
+          const pData = JSON.parse(fs.readFileSync(fullProjPath, "utf-8"));
           const pid = pData.id || f.replace(/\.json$/, "");
+          const isGhost = sidecarProjIds.has(pid) || (pData.name && (pData.name.startsWith("plugin-") || pData.name.includes("/sidecars/") || pData.name.includes("/panel") || pData.name.includes("/")));
+          if (isGhost) {
+            try { fs.unlinkSync(fullProjPath); } catch (e) {}
+            continue;
+          }
           if (pid && !seenProjIds.has(pid)) {
             seenProjIds.add(pid);
             const paths = [];
