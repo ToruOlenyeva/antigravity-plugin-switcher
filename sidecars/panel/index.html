@@ -409,6 +409,36 @@
     .plugin-card.disabled {
       opacity: 0.6;
     }
+    .plugin-icon-wrap {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+    .plugin-icon-img {
+      width: 28px;
+      height: 28px;
+      object-fit: contain;
+      display: block;
+    }
+    .plugin-icon-fallback {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+      color: #ffffff;
+      text-transform: uppercase;
+      user-select: none;
+    }
     .plugin-info {
       display: flex;
       flex-direction: column;
@@ -1293,6 +1323,45 @@
       renderPluginCards();
     }
 
+    function createPluginIconEl(p, displayTitle) {
+      const wrap = document.createElement("div");
+      wrap.className = "plugin-icon-wrap";
+
+      const fallbackColors = [
+        "#5c6bc0", "#26a69a", "#42a5f5", "#ab47bc",
+        "#ec407a", "#ffa726", "#66bb6a", "#78909c"
+      ];
+      let hash = 0;
+      const str = p.dir || "";
+      for (let i = 0; i < str.length; i++) {
+        hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+      }
+      const bg = fallbackColors[hash % fallbackColors.length];
+
+      const fallback = document.createElement("div");
+      fallback.className = "plugin-icon-fallback";
+      fallback.style.background = bg;
+      const firstChar = (displayTitle || p.displayName || p.name || p.dir || "?").trim().charAt(0);
+      fallback.textContent = firstChar;
+
+      if (p.logoUrl) {
+        const img = document.createElement("img");
+        img.className = "plugin-icon-img";
+        img.src = p.logoUrl;
+        img.alt = p.displayName || p.name || p.dir;
+        img.loading = "lazy";
+        img.onerror = () => {
+          img.remove();
+          wrap.appendChild(fallback);
+        };
+        wrap.appendChild(img);
+      } else {
+        wrap.appendChild(fallback);
+      }
+
+      return wrap;
+    }
+
     function renderPluginCards() {
       const container = document.getElementById("pluginList");
       container.innerHTML = "";
@@ -1340,6 +1409,8 @@
         }
         info.appendChild(desc);
 
+        const iconEl = createPluginIconEl(p, title.textContent);
+        card.appendChild(iconEl);
         card.appendChild(info);
 
         const switchLabel = document.createElement("label");

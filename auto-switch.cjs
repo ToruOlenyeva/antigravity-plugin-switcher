@@ -123,7 +123,7 @@ function ensureSidecarServerRunning() {
     const req = http.request({
       hostname: "127.0.0.1",
       port: 8088,
-      path: "/api/status",
+      path: "/api/status?passive=1",
       method: "GET",
       timeout: 300
     }, () => {});
@@ -149,8 +149,13 @@ function ensureSidecarServerRunning() {
 }
 
 async function main() {
+  const hookMode = process.argv[2] || "pre-invocation";
+  const defaultReply = hookMode === "pre-tool" ? { decision: "allow" } : {};
+
   try {
-    ensureSidecarServerRunning();
+    if (hookMode !== "pre-tool") {
+      ensureSidecarServerRunning();
+    }
     const raw = await readStdin();
     let payload = {};
     if (raw.trim()) {
@@ -158,14 +163,14 @@ async function main() {
     }
 
     if (!fs.existsSync(configPath) || !fs.existsSync(profilesPath)) {
-      return reply({});
+      return reply(defaultReply);
     }
 
     let profiles = {};
     try {
       profiles = JSON.parse(fs.readFileSync(profilesPath, "utf-8"));
     } catch (e) {
-      return reply({});
+      return reply(defaultReply);
     }
 
     // 1. 构建包含 ~/.gemini/config/projects 与 profiles 的完整项目列表（自动清除伴生容器空壳项目）
@@ -225,6 +230,11 @@ async function main() {
       }
     }
 
+    if (!profiles.__meta__) profiles.__meta__ = {};
+    if (!profiles.__meta__.convProjectMap || typeof profiles.__meta__.convProjectMap !== "object") {
+      profiles.__meta__.convProjectMap = {};
+    }
+
     // 2. 提取 payloadConvId（支持 direct/cascade/trajectory 以及从 transcriptPath 或 JSON 正则提取）
     let payloadConvId = payload.conversationId || payload.conversation_id || payload.cascadeId || payload.trajectoryId || "";
     if (!payloadConvId) {
@@ -237,13 +247,18 @@ async function main() {
 
     let convProjId = "";
     if (payloadConvId) {
-      convProjId = resolveProjectIdByConvId(payloadConvId, CONV_DB_PATH);
-      if (convProjId && !profiles[convProjId] && !seenProjIds.has(convProjId)) {
-        convProjId = "";
+      const cachedProjId = profiles.__meta__.convProjectMap[payloadConvId] || "";
+      if (cachedProjId && (profiles[cachedProjId] || seenProjIds.has(cachedProjId))) {
+        convProjId = cachedProjId;
+      } else {
+        convProjId = resolveProjectIdByConvId(payloadConvId, CONV_DB_PATH);
+        if (convProjId && !profiles[convProjId] && !seenProjIds.has(convProjId)) {
+          convProjId = "";
+        }
       }
     }
 
-    // 3. 收集工作区候选 URI
+    // 3. 收集工作区候选 URI（含 PreToolUse 工具参数路径反推，解决新会话与子智能体溯源）
     const candidateUris = [];
     if (Array.isArray(payload.workspaceUris)) candidateUris.push(...payload.workspaceUris);
     else if (typeof payload.workspaceUris === "string") candidateUris.push(payload.workspaceUris);
@@ -259,6 +274,19 @@ async function main() {
     if (payload.workspaceUri) candidateUris.push(payload.workspaceUri);
     if (payload.workspaceFolder) candidateUris.push(payload.workspaceFolder);
     if (payload.cwd) candidateUris.push(payload.cwd);
+
+    if (payload.toolCall && payload.toolCall.args && typeof payload.toolCall.args === "object") {
+      const tArgs = payload.toolCall.args;
+      const toolPaths = [tArgs.Cwd, tArgs.AbsolutePath, tArgs.TargetFile, tArgs.SearchPath, tArgs.DirectoryPath];
+      for (const tp of toolPaths) {
+        if (typeof tp === "string" && tp.trim()) {
+          const normTp = tp.replace(/\\/g, "/").toLowerCase();
+          if (!normTp.includes(".gemini/antigravity/brain")) {
+            candidateUris.push(tp);
+          }
+        }
+      }
+    }
 
     let wsProjId = "";
     if (candidateUris.length > 0) {
@@ -311,8 +339,9 @@ async function main() {
       }
     }
 
-    // 5. 兜底：若仍无 activeProjectId，读取 app_storage.json 的 projectsConversationOrder[0]
-    if (!activeProjectId && fs.existsSync(APP_STORAGE_FILE)) {
+    // 5. 兜底：仅在非 pre-tool 模式下才允许读取 app_storage.json 的 projectsConversationOrder[0]
+    // （避免后台对话执行工具时误将前台窗口焦点当成后台对话所属项目）
+    if (!activeProjectId && hookMode !== "pre-tool" && fs.existsSync(APP_STORAGE_FILE)) {
       try {
         const appStorage = JSON.parse(fs.readFileSync(APP_STORAGE_FILE, "utf-8"));
         const convOrder = JSON.parse(appStorage.projectsConversationOrder || "[]");
@@ -328,7 +357,7 @@ async function main() {
 
     // 严禁使用 process.env.WORKSPACE_ROOT 兜底！直接放行，避免误伤
     if (!activeProjectId || !profiles[activeProjectId]) {
-      return reply({});
+      return reply(defaultReply);
     }
 
     const matchedProfile = profiles[activeProjectId];
@@ -340,40 +369,26 @@ async function main() {
     try {
       configObj = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     } catch (e) {
-      return reply({});
+      return reply(defaultReply);
     }
     if (!configObj.plugins) configObj.plugins = {};
 
-    if (!profiles.__meta__) profiles.__meta__ = {};
     const lastActiveId = profiles.__meta__.lastActiveProjectId || "";
-    const lastPanelActionAt = Number(profiles.__meta__.lastPanelActionAt || 0);
+    let metaChanged = false;
 
-    // 分支 B：仍处于同一项目内
-    if (lastActiveId === activeProjectId) {
-      // 尊重面板最近操作锁：若 5 秒内用户在面板操作过，禁止反向覆盖！
-      if (Date.now() - lastPanelActionAt < 5000) {
-        return reply({});
-      }
-      let profileChanged = false;
-      for (const [pluginDir, pluginCfg] of Object.entries(configObj.plugins)) {
-        if (pluginDir.startsWith(".")) continue;
-        if (PROTECTED_PLUGINS.has(pluginDir)) continue;
-        const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
-        if (matchedProfile.plugins[pluginDir] !== enabledInConfig) {
-          matchedProfile.plugins[pluginDir] = enabledInConfig;
-          profileChanged = true;
+    if (payloadConvId && profiles.__meta__.convProjectMap[payloadConvId] !== activeProjectId) {
+      profiles.__meta__.convProjectMap[payloadConvId] = activeProjectId;
+      const keys = Object.keys(profiles.__meta__.convProjectMap);
+      if (keys.length > 120) {
+        for (let i = 0; i < keys.length - 100; i++) {
+          delete profiles.__meta__.convProjectMap[keys[i]];
         }
       }
-      if (profileChanged) {
-        try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
-      }
-      return reply({});
+      metaChanged = true;
     }
 
-    // 分支 A：跨项目切换
-    profiles.__meta__.lastActiveProjectId = activeProjectId;
-    try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
-
+    // 无论 lastActiveId 是否等于 activeProjectId，Hook 一律以 matchedProfile.plugins 为唯一权威真源正向校验 config.json
+    // 绝不在 Hook 中用 config.json 反向覆盖 matchedProfile.plugins，彻底杜绝前后台切换时相互污染 Profile！
     let hasDiff = false;
     const rpcUpdates = {};
 
@@ -390,6 +405,16 @@ async function main() {
         rpcUpdates[pluginDir] = { enabled: targetStatus };
         hasDiff = true;
       }
+    }
+
+    if (lastActiveId !== activeProjectId || hasDiff) {
+      profiles.__meta__.lastActiveProjectId = activeProjectId;
+      profiles.__meta__.lastBgHookAt = Date.now();
+      metaChanged = true;
+    }
+
+    if (metaChanged) {
+      try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
     }
 
     if (hasDiff) {
@@ -419,9 +444,9 @@ async function main() {
       }
     }
 
-    return reply({});
+    return reply(defaultReply);
   } catch (err) {
-    return reply({});
+    return reply(defaultReply);
   }
 }
 

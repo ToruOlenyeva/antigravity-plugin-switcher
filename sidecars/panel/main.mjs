@@ -23,7 +23,7 @@ const DEFAULT_KEY = "__default__";
 const PRELOAD_SDK_PATH = path.join(homeDir, ".gemini", "antigravity", "lib", "node_modules", "sidecar_sdk", "preload.js");
 
 function isValidPluginDirectory(dirName) {
-  if (!dirName || dirName.startsWith(".")) return false;
+  if (!dirName || typeof dirName !== "string" || dirName.startsWith(".") || dirName.includes("..") || dirName.includes("/") || dirName.includes("\\")) return false;
   const fullDir = path.join(PLUGINS_DIR, dirName);
   const candidates = [
     path.join(fullDir, "plugin.json"),
@@ -130,6 +130,67 @@ function readJsonSafe(filePath, fallback = {}) {
     }
   } catch (e) {}
   return fallback;
+}
+
+function getPluginManifest(dir) {
+  if (!dir || typeof dir !== "string" || dir.includes("..") || dir.includes("/") || dir.includes("\\")) {
+    return {};
+  }
+  const candidateManifests = [
+    path.join(PLUGINS_DIR, dir, "plugin.json"),
+    path.join(PLUGINS_DIR, dir, ".antigravity-plugin", "plugin.json"),
+    path.join(PLUGINS_DIR, dir, ".gemini-plugin", "plugin.json"),
+    path.join(PLUGINS_DIR, dir, ".claude-plugin", "plugin.json")
+  ];
+  for (const mPath of candidateManifests) {
+    if (fs.existsSync(mPath)) {
+      return readJsonSafe(mPath, {});
+    }
+  }
+  return {};
+}
+
+function resolvePluginLogoFile(dir, manifest = {}) {
+  if (!dir || typeof dir !== "string" || dir.includes("..") || dir.includes("/") || dir.includes("\\")) {
+    return null;
+  }
+  const pluginBaseDir = path.resolve(PLUGINS_DIR, dir);
+  const probeCandidates = [];
+
+  if (typeof manifest.logo === "string" && manifest.logo.trim()) {
+    const trimmed = manifest.logo.trim();
+    if (!/^(https?:|data:)/i.test(trimmed)) {
+      probeCandidates.push(trimmed);
+    }
+  }
+
+  probeCandidates.push("assets/logo.svg", "assets/logo.png", "logo.svg", "logo.png");
+
+  for (const relPath of probeCandidates) {
+    const fullLogoPath = path.resolve(pluginBaseDir, relPath);
+    if (fullLogoPath.startsWith(pluginBaseDir + path.sep) && fs.existsSync(fullLogoPath)) {
+      return fullLogoPath;
+    }
+  }
+
+  return null;
+}
+
+function resolvePluginLogoUrl(dir, manifest = {}) {
+  if (!dir || typeof dir !== "string") return "";
+  if (typeof manifest.logo === "string" && manifest.logo.trim()) {
+    const trimmed = manifest.logo.trim();
+    if (/^(https?:|data:)/i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+
+  const localFile = resolvePluginLogoFile(dir, manifest);
+  if (localFile) {
+    return `/api/plugin-logo?dir=${encodeURIComponent(dir)}`;
+  }
+
+  return "";
 }
 
 let lastInternalConfigWriteMs = 0;
@@ -648,7 +709,8 @@ function getSystemState(query = {}) {
           displayName: manifest.displayName || manifest.name || dir,
           description: manifest.description || "本地安装的 Antigravity 插件",
           enabled: isEnabled,
-          protected: PROTECTED_PLUGINS.has(dir)
+          protected: PROTECTED_PLUGINS.has(dir),
+          logoUrl: resolvePluginLogoUrl(dir, manifest)
         });
       }
     }
@@ -670,8 +732,9 @@ function getSystemState(query = {}) {
     const activeProfile = profiles[activeProjectId];
 
     if (lastActiveId !== activeProjectId) {
-      if (isPassive && lastActiveId) {
-        // 禁止在被动心跳中执行分支 A 的跨项目 config.json 覆写与 lastActiveProjectId 篡改！
+      const noExplicitContext = !convId && !clientProjectId && !clientWorkspaceUri && !token;
+      if ((isPassive || noExplicitContext) && lastActiveId) {
+        // 禁止在被动心跳或无上下文探活中执行分支 A 的跨项目 config.json 覆写与 lastActiveProjectId 篡改！
       } else {
         // 分支 A：跨项目切换跃变！正向将该项目的独立配置写入 config.json
         if (!config.plugins) config.plugins = {};
@@ -706,16 +769,20 @@ function getSystemState(query = {}) {
       }
     } else {
       // 分支 B：停留在同一项目内！检测用户在 Antigravity 软件原生设置中的变动，反向同步进 activeProfile
-      let profileChanged = false;
-      for (const p of installedPlugins) {
-        if (p.protected) continue;
-        if (activeProfile.plugins[p.dir] !== p.enabled) {
-          activeProfile.plugins[p.dir] = p.enabled;
-          profileChanged = true;
+      // 防护栏：若 5 秒内刚发生过后台 Hook 切换（lastBgHookAt），禁止把后台临时状态反向写回当前项目 Profile
+      const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
+      if (Date.now() - lastBgHookAt > 5000) {
+        let profileChanged = false;
+        for (const p of installedPlugins) {
+          if (p.protected) continue;
+          if (activeProfile.plugins[p.dir] !== p.enabled) {
+            activeProfile.plugins[p.dir] = p.enabled;
+            profileChanged = true;
+          }
         }
-      }
-      if (profileChanged) {
-        profilesModified = true;
+        if (profileChanged) {
+          profilesModified = true;
+        }
       }
     }
   }
@@ -902,6 +969,44 @@ async function requestHandler(req, res) {
     const isPassive = url.searchParams.get("passive") === "1";
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, isPassive })));
+    return;
+  }
+
+  // 插件图标本地静态资源服务
+  if (req.method === "GET" && pathname === "/api/plugin-logo") {
+    const dir = url.searchParams.get("dir") || "";
+    if (!dir || !isValidPluginDirectory(dir) || dir.includes("..") || dir.includes("/") || dir.includes("\\")) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid plugin directory" }));
+      return;
+    }
+
+    const manifest = getPluginManifest(dir);
+    const logoFilePath = resolvePluginLogoFile(dir, manifest);
+
+    if (logoFilePath && fs.existsSync(logoFilePath)) {
+      const ext = path.extname(logoFilePath).toLowerCase();
+      let contentType = "application/octet-stream";
+      if (ext === ".svg") {
+        contentType = "image/svg+xml; charset=utf-8";
+      } else if (ext === ".png") {
+        contentType = "image/png";
+      } else if (ext === ".jpg" || ext === ".jpeg") {
+        contentType = "image/jpeg";
+      } else if (ext === ".webp") {
+        contentType = "image/webp";
+      }
+
+      res.writeHead(200, {
+        "Content-Type": contentType,
+        "Cache-Control": "public, max-age=300"
+      });
+      res.end(fs.readFileSync(logoFilePath));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Plugin logo not found" }));
     return;
   }
 

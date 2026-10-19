@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="ps-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="ps-track-on" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="ps-track-off" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+    <linearGradient id="ps-knob" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <filter id="ps-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#06b6d4" flood-opacity="0.45"/>
+    </filter>
+    <filter id="ps-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- Background Card -->
+  <rect x="24" y="24" width="208" height="208" rx="44" fill="url(#ps-bg)" stroke="#38bdf8" stroke-width="3" stroke-opacity="0.35"/>
+  <!-- Decorative Accent Dots -->
+  <circle cx="56" cy="56" r="3" fill="#38bdf8" opacity="0.4"/>
+  <circle cx="72" cy="56" r="3" fill="#38bdf8" opacity="0.2"/>
+  <circle cx="56" cy="72" r="3" fill="#38bdf8" opacity="0.2"/>
+  <circle cx="200" cy="200" r="3" fill="#38bdf8" opacity="0.4"/>
+  <circle cx="184" cy="200" r="3" fill="#38bdf8" opacity="0.2"/>
+  <circle cx="200" cy="184" r="3" fill="#38bdf8" opacity="0.2"/>
+  <!-- Top Switch (ON) -->
+  <g filter="url(#ps-glow)">
+    <rect x="60" y="78" width="136" height="44" rx="22" fill="url(#ps-track-on)"/>
+    <circle cx="164" cy="100" r="16" fill="url(#ps-knob)" filter="url(#ps-shadow)"/>
+    <path d="M164 92 v9" stroke="#0284c7" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="84" cy="100" r="5" fill="#ffffff" opacity="0.85"/>
+    <path d="M98 100 h26" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.6"/>
+  </g>
+  <!-- Bottom Switch (OFF / Standby) -->
+  <g>
+    <rect x="60" y="134" width="136" height="44" rx="22" fill="url(#ps-track-off)"/>
+    <circle cx="92" cy="156" r="16" fill="url(#ps-knob)" filter="url(#ps-shadow)"/>
+    <circle cx="92" cy="156" r="5" fill="none" stroke="#64748b" stroke-width="2.5"/>
+    <path d="M132 156 h34" stroke="#64748b" stroke-width="3" stroke-linecap="round" opacity="0.5"/>
+  </g>
+</svg>
