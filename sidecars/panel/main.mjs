@@ -235,24 +235,15 @@ function scanAntigravityProjects() {
   const projectList = [];
   if (!fs.existsSync(PROJECTS_DIR)) return projectList;
 
-  // 1. 读取侧边栏拖拽顺序与伴生容器配置
+  // 1. 读取侧边栏拖拽顺序
   const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
-  const hostConfig = readJsonSafe(CONFIG_FILE, {});
-  const sidecarProjectIds = new Set();
-  if (hostConfig && hostConfig.sidecars && typeof hostConfig.sidecars === "object") {
-    for (const sc of Object.values(hostConfig.sidecars)) {
-      if (sc && sc.projectId) sidecarProjectIds.add(sc.projectId);
-    }
-  }
 
   let orderArray = [];
   try {
     orderArray = JSON.parse(appStorage.projectsOrder || "[]");
   } catch (e) {}
 
-  let storageOrderModified = false;
-
-  // 2. 读取 projects 目录下全部项目配置，并自动物理清除宿主生成的伴生空壳项目
+  // 2. 读取 projects 目录下全部项目配置
   try {
     const files = fs.readdirSync(PROJECTS_DIR);
     for (const f of files) {
@@ -260,22 +251,6 @@ function scanAntigravityProjects() {
       const fullPath = path.join(PROJECTS_DIR, f);
       const data = readJsonSafe(fullPath, null);
       if (!data || !data.id) continue;
-
-      const isGhostSidecarProject =
-        sidecarProjectIds.has(data.id) ||
-        (data.name && (data.name.startsWith("plugin-") || data.name.includes("/sidecars/") || data.name.includes("/panel") || data.name.includes("/")));
-
-      if (isGhostSidecarProject) {
-        // 自动物理删除宿主为 Sidecar 生成的伴生空壳项目文件，防止污染宿主原生侧边栏与设置页
-        try {
-          fs.unlinkSync(fullPath);
-        } catch (e) {}
-        if (orderArray.includes(data.id)) {
-          orderArray = orderArray.filter(id => id !== data.id);
-          storageOrderModified = true;
-        }
-        continue;
-      }
 
       if (data.archived === true || data.isArchived === true) continue;
 
@@ -306,11 +281,6 @@ function scanAntigravityProjects() {
       });
     }
   } catch (e) {}
-
-  if (storageOrderModified) {
-    appStorage.projectsOrder = JSON.stringify(orderArray);
-    writeJsonSafe(APP_STORAGE_FILE, appStorage);
-  }
 
   const orderMap = new Map();
   orderArray.forEach((id, index) => {
@@ -621,21 +591,10 @@ function getSystemState(query = {}) {
     };
   }
 
-  // 2. 清洗 profiles：剔除所有基于磁盘物理路径的冗余顶层 Key 与伴生容器，仅保留真实项目 UUID 和特殊 Key
-  const sidecarProjectIds = new Set();
-  if (config && config.sidecars && typeof config.sidecars === "object") {
-    for (const sc of Object.values(config.sidecars)) {
-      if (sc && sc.projectId) sidecarProjectIds.add(sc.projectId);
-    }
-  }
-
+  // 2. 清洗 profiles：剔除所有基于磁盘物理路径的冗余顶层 Key，仅保留真实项目 UUID 和特殊 Key
   const profiles = {};
   let profilesModified = false;
   for (const [k, v] of Object.entries(rawProfiles)) {
-    if (sidecarProjectIds.has(k)) {
-      profilesModified = true;
-      continue;
-    }
     if (k === DEFAULT_KEY || k === "__meta__" || /^[0-9a-f-]{36}$/i.test(k)) {
       profiles[k] = v;
     } else {
@@ -850,7 +809,6 @@ async function requestHandler(req, res) {
         const isEn = lang === "en";
         const pluginJsonPath = path.join(PLUGINS_DIR, "plugin-switcher", "plugin.json");
         const localSidecarPath = path.join(__dirname, "sidecar.json");
-        const globalSidecarPath = path.join(homeDir, ".gemini", "config", "sidecars", "plugin-switcher-panel", "sidecar.json");
 
         const targetDisplayName = isEn ? "Project Plugin Switcher" : "项目插件独立开关管理器";
         const targetDesc = isEn
@@ -867,16 +825,14 @@ async function requestHandler(req, res) {
           writeJsonSafe(pluginJsonPath, pluginJson);
         }
 
-        // 2. 更新 local & global sidecar.json
-        for (const sPath of [localSidecarPath, globalSidecarPath]) {
-          const scJson = readJsonSafe(sPath, null);
-          if (scJson) {
-            scJson.display_name = targetSidecarDisplayName;
-            if (scJson.ui_config?.views?.[0]) {
-              scJson.ui_config.views[0].title = targetViewTitle;
-            }
-            writeJsonSafe(sPath, scJson);
+        // 2. 更新插件内嵌 sidecar.json
+        const scJson = readJsonSafe(localSidecarPath, null);
+        if (scJson) {
+          scJson.display_name = targetSidecarDisplayName;
+          if (scJson.ui_config?.views?.[0]) {
+            scJson.ui_config.views[0].title = targetViewTitle;
           }
+          writeJsonSafe(localSidecarPath, scJson);
         }
 
         // 3. 更新 app_storage.json 中的 Tab 标题

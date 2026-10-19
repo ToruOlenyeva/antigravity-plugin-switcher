@@ -153,7 +153,7 @@ All endpoints are hosted locally at <code>http://127.0.0.1:8088</code>.
 - <b>Payload</b>: <code>{ "lang": "en" }</code> or <code>{ "lang": "zh" }</code>
 - <b>Behavior</b>:
   - Updates <code>displayName</code> and <code>description</code> in <code>plugin.json</code>.
-  - Updates <code>display_name</code> and view title in local and global <code>sidecar.json</code>.
+  - Updates <code>display_name</code> and view title in the plugin-embedded <code>sidecar.json</code>.
   - Rewrites tab title values in <code>app_storage.json</code>.
 - <b>Response</b>: <code>{ "success": true, "lang": "en" }</code>
 

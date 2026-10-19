@@ -153,7 +153,7 @@ Sidecar 优先提取客户端请求中携带的显式参数：
 - <b>请求体</b>：<code>{ "lang": "en" }</code> 或 <code>{ "lang": "zh" }</code>
 - <b>处理行为</b>：
   - 更新 <code>plugin.json</code> 中的 <code>displayName</code> 与 <code>description</code>。
-  - 更新本地及全局 <code>sidecar.json</code> 中的 <code>display_name</code> 与 <code>title</code>。
+  - 更新插件内嵌 <code>sidecar.json</code> 中的 <code>display_name</code> 与 <code>title</code>。
   - 动态重写 <code>app_storage.json</code> 中所有对应 Tab 的标题。
 - <b>返回格式</b>：<code>{ "success": true, "lang": "en" }</code>
 
