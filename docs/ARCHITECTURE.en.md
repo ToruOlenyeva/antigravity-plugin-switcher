@@ -10,7 +10,35 @@ This extension operates within the <b>Google Antigravity 2.0</b> desktop client 
 
 Antigravity Plugin Switcher consists of two core components working in tandem:
 - <b>Hook Interceptor (auto-switch.cjs)</b>: Operates as an Antigravity lifecycle hook, intercepting workspace environment variables and session events.
-- <b>Sidecar Daemon (main.mjs + index.html)</b>: Operates as an isolated Node.js microservice and web dashboard, providing real-time management on port 8088 and within the Auxiliary Pane.
+- <b>Sidecar Daemon & Modular UI (sidecars/panel/)</b>: Implements a build-free native frontend/backend decoupled architecture, providing real-time management on port 8088 and within the Auxiliary Pane. Features backend modules (<code>main.mjs</code> HTTP routing, <code>ls-bridge.mjs</code> host RPC bridge, <code>scanner.mjs</code> status scoring scanner) and frontend assets (<code>index.html</code> skeleton, <code>styles.css</code> themes, <code>i18n.js</code> dictionary, <code>app.js</code> interaction engine).
+
+### 1.1 Modular Project Structure
+
+```
+plugin-switcher/
+├── assets/
+│   └── logo.svg                 # Vector brand logo
+├── docs/
+│   ├── ARCHITECTURE.en.md       # English architecture design doc
+│   └── ARCHITECTURE.md          # Chinese architecture design doc
+├── sidecars/
+│   └── panel/                   # Native build-free decoupled Sidecar panel
+│       ├── app.js               # Frontend interaction and state sync engine
+│       ├── i18n.js              # Frontend internationalization dictionary
+│       ├── index.html           # Frontend HTML skeleton structure
+│       ├── ls-bridge.mjs        # Backend host RPC bridge and disk persistence
+│       ├── main.mjs             # Backend HTTP routing and static file server
+│       ├── scanner.mjs          # Backend workspace scanner and 4-tier engine
+│       ├── sidecar.json         # Antigravity Sidecar container manifest
+│       └── styles.css           # Frontend responsive adaptive stylesheets
+├── auto-switch.cjs              # Host lifecycle Hook interceptor
+├── hooks.json                   # Antigravity Hook configuration
+├── open-panel.bat               # Standalone window quick launcher script
+├── plugin.json                  # Antigravity plugin manifest
+├── project-plugin-profiles.example.json # Example profile configuration
+├── README.en.md                 # English documentation
+└── README.md                    # Chinese documentation
+```
 
 ```
 +-----------------------------------------------------------+

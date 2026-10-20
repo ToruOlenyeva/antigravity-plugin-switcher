@@ -10,7 +10,35 @@
 
 Plugin Switcher 由两大协同组件构成：
 - <b>Hook 路由拦截器（auto-switch.cjs）</b>：作为 Antigravity 宿主预处理 Hook，在会话生命周期事件触发时运行，拦截并分发项目环境变量。
-- <b>Sidecar 常驻服务（main.mjs + index.html）</b>：作为独立 Node.js 常驻微服务与可视化前端，通过 8088 端口与辅助栏（Auxiliary Pane）提供实时操控能力。
+- <b>Sidecar 常驻微服务与模块化前端（sidecars/panel/）</b>：采用原生免构建前后端物理解耦架构，通过 8088 端口与辅助栏（Auxiliary Pane）提供实时操控能力。包含后端服务（<code>main.mjs</code> 路由入口、<code>ls-bridge.mjs</code> 宿主通信、<code>scanner.mjs</code> 状态打分扫描）与前端静态套件（<code>index.html</code> 骨架、<code>styles.css</code> 主题样式、<code>i18n.js</code> 双语词典、<code>app.js</code> 交互引擎）。
+
+### 1.1 模块化工程目录树
+
+```
+plugin-switcher/
+├── assets/
+│   └── logo.svg                 # 矢量品牌图标
+├── docs/
+│   ├── ARCHITECTURE.en.md       # 英文架构设计文档
+│   └── ARCHITECTURE.md          # 中文架构设计文档
+├── sidecars/
+│   └── panel/                   # 原生免构建前后端物理分离 Sidecar 面板
+│       ├── app.js               # 前端核心交互引擎与状态同步
+│       ├── i18n.js              # 前端多语言字典与国际化引擎
+│       ├── index.html           # 前端纯骨架页面
+│       ├── ls-bridge.mjs        # 后端宿主 RPC 通信与状态原子化落盘
+│       ├── main.mjs             # 后端 HTTP 路由入口与静态文件托管
+│       ├── scanner.mjs          # 后端项目扫描与四级裁决打分引擎
+│       ├── sidecar.json         # Antigravity Sidecar 容器元数据契约
+│       └── styles.css           # 前端现代自适应主题样式表
+├── auto-switch.cjs              # 宿主生命周期 Hook 拦截器
+├── hooks.json                   # Antigravity Hook 配置文件
+├── open-panel.bat               # 独立小窗快速启动脚本
+├── plugin.json                  # Antigravity 插件公开元数据契约
+├── project-plugin-profiles.example.json # 示例配置档案
+├── README.en.md                 # 英文说明文档
+└── README.md                    # 中文说明文档
+```
 
 ```
 +-----------------------------------------------------------+

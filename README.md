@@ -74,6 +74,33 @@ git clone https://github.com/ToruOlenyeva/antigravity-plugin-switcher.git %USERP
 
 ---
 
+## 📂 模块化目录结构
+
+```
+plugin-switcher/
+├── assets/                      # 品牌矢量图标
+├── docs/                        # 深度技术架构文档
+├── sidecars/
+│   └── panel/                   # 原生免构建前后端分离 Sidecar 面板
+│       ├── app.js               # 前端核心交互引擎与状态同步
+│       ├── i18n.js              # 前端多语言字典与国际化
+│       ├── index.html           # 前端纯骨架页面
+│       ├── ls-bridge.mjs        # 后端宿主 RPC 与原子写盘
+│       ├── main.mjs             # 后端 HTTP 路由入口与静态托管
+│       ├── scanner.mjs          # 后端项目扫描与四级裁决打分
+│       ├── sidecar.json         # Sidecar 容器清单契约
+│       └── styles.css           # 现代化自适应主题样式表
+├── auto-switch.cjs              # 会话生命周期 Hook 拦截器
+├── hooks.json                   # Antigravity Hook 契约
+├── open-panel.bat               # 独立小窗模式快速启动脚本
+├── plugin.json                  # 插件公开元数据契约
+├── project-plugin-profiles.example.json # 示例配置档案
+├── README.en.md                 # 英文说明文档
+└── README.md                    # 中文说明文档
+```
+
+---
+
 ## 📖 使用方法指南
 
 ### 1. 单项目独立配置

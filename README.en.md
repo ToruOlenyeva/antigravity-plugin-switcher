@@ -74,6 +74,33 @@ Restart Google Antigravity or enable the plugin in the Antigravity Plugins setti
 
 ---
 
+## 📂 Modular Project Structure
+
+```
+plugin-switcher/
+├── assets/                      # Brand assets and vector logos
+├── docs/                        # Deep technical architecture documentation
+├── sidecars/
+│   └── panel/                   # Native build-free decoupled Sidecar panel
+│       ├── app.js               # Frontend interaction and state sync engine
+│       ├── i18n.js              # Frontend internationalization dictionary
+│       ├── index.html           # Frontend HTML skeleton structure
+│       ├── ls-bridge.mjs        # Backend host RPC bridge and disk persistence
+│       ├── main.mjs             # Backend HTTP routing and static server
+│       ├── scanner.mjs          # Backend workspace scanner and 4-tier engine
+│       ├── sidecar.json         # Sidecar container manifest
+│       └── styles.css           # Responsive adaptive stylesheet
+├── auto-switch.cjs              # Host lifecycle Hook interceptor
+├── hooks.json                   # Antigravity Hook configuration
+├── open-panel.bat               # Standalone window quick launcher script
+├── plugin.json                  # Plugin manifest
+├── project-plugin-profiles.example.json # Example profile configuration
+├── README.en.md                 # English documentation
+└── README.md                    # Chinese documentation
+```
+
+---
+
 ## 📖 Usage Guide
 
 ### 1. Workspace Profile Customization
