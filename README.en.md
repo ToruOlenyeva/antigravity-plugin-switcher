@@ -18,6 +18,10 @@
 
 > <b>Eliminate plugin bloat and context pollution</b>: Purpose-built for <b>Google Antigravity 2.0</b> (the parallel agent desktop application featuring the left-hand project tree and right-hand HTML Auxiliary Pane). Solve the critical issue where sharing a single global <code>config.json</code> across all projects and chat sessions wastes context window and tokens.
 
+<div align="center">
+  <img src="assets/preview-en.png" width="840" alt="Antigravity Plugin Switcher Preview" />
+</div>
+
 ---
 
 ## ✨ Key Features

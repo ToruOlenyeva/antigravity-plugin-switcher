@@ -18,6 +18,10 @@
 
 > <b>告别插件冗余与上下文污染</b>：专为 <b>Google Antigravity 2.0</b>（并行多智能体桌面客户端，含左侧项目会话树与右侧 Auxiliary Pane 辅助侧边栏）打造。解决全局共用单一 <code>config.json</code> 导致不同项目与纯聊天会话间插件互相干扰、浪费 Token 与上下文窗口的痛点，为每个项目构建专属的插件运行环境。
 
+<div align="center">
+  <img src="assets/preview-zh.png" width="840" alt="Antigravity Plugin Switcher Preview" />
+</div>
+
 ---
 
 ## ✨ 核心特性
