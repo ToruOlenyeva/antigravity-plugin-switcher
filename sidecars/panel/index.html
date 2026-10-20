@@ -1297,14 +1297,13 @@
       let sourcePlugins = {};
       if (currentSelectedId === DEFAULT_KEY) {
         sourcePlugins = (state.profiles[DEFAULT_KEY] && state.profiles[DEFAULT_KEY].plugins) || {};
+      } else if (customProfile && customProfile.plugins) {
+        sourcePlugins = customProfile.plugins;
       } else if (currentSelectedId === state.activeProjectId) {
-        // 核心双向联动：当前选中的正是宿主活跃项目！以软件本体运行态 (state.plugins) 为唯一事实来源！
         sourcePlugins = {};
         for (const p of (state.plugins || [])) {
           sourcePlugins[p.dir] = p.enabled;
         }
-      } else if (customProfile && customProfile.plugins) {
-        sourcePlugins = customProfile.plugins;
       } else {
         sourcePlugins = (state.profiles[DEFAULT_KEY] && state.profiles[DEFAULT_KEY].plugins) || {};
       }

@@ -277,7 +277,7 @@ async function main() {
 
     if (payload.toolCall && payload.toolCall.args && typeof payload.toolCall.args === "object") {
       const tArgs = payload.toolCall.args;
-      const toolPaths = [tArgs.Cwd, tArgs.AbsolutePath, tArgs.TargetFile, tArgs.SearchPath, tArgs.DirectoryPath];
+      const toolPaths = [tArgs.Cwd, tArgs.AbsolutePath, tArgs.TargetFile, tArgs.Path, tArgs.path, tArgs.file_path, tArgs.SearchPath, tArgs.DirectoryPath];
       for (const tp of toolPaths) {
         if (typeof tp === "string" && tp.trim()) {
           const normTp = tp.replace(/\\/g, "/").toLowerCase();
@@ -410,7 +410,18 @@ async function main() {
     if (lastActiveId !== activeProjectId || hasDiff) {
       profiles.__meta__.lastActiveProjectId = activeProjectId;
       profiles.__meta__.lastBgHookAt = Date.now();
+      profiles.__meta__.lastInternalConfigWriteAt = Date.now();
+      const snap = {};
+      for (const [k, v] of Object.entries(configObj.plugins || {})) {
+        if (k.startsWith(".") || PROTECTED_PLUGINS.has(k)) continue;
+        snap[k] = Boolean(!v || v.enabled !== false);
+      }
+      profiles.__meta__.lastAppliedConfigSnapshot = snap;
       metaChanged = true;
+    }
+
+    if (hasDiff) {
+      fs.writeFileSync(configPath, JSON.stringify(configObj, null, 2), "utf-8");
     }
 
     if (metaChanged) {
@@ -418,7 +429,6 @@ async function main() {
     }
 
     if (hasDiff) {
-      fs.writeFileSync(configPath, JSON.stringify(configObj, null, 2), "utf-8");
 
       const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "localhost:5387";
       const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";

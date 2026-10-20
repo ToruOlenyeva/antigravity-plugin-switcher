@@ -195,6 +195,26 @@ function resolvePluginLogoUrl(dir, manifest = {}) {
 
 let lastInternalConfigWriteMs = 0;
 
+function extractConfigPluginSnapshot(config) {
+  const snap = {};
+  if (config && config.plugins && typeof config.plugins === "object") {
+    for (const [dir, entry] of Object.entries(config.plugins)) {
+      if (dir.startsWith(".") || PROTECTED_PLUGINS.has(dir)) continue;
+      snap[dir] = Boolean(!entry || entry.enabled !== false);
+    }
+  }
+  return snap;
+}
+
+function recordConfigWriteMeta(profiles, config) {
+  if (!profiles || typeof profiles !== "object") return;
+  if (!profiles.__meta__) profiles.__meta__ = {};
+  const now = Date.now();
+  lastInternalConfigWriteMs = now;
+  profiles.__meta__.lastInternalConfigWriteAt = now;
+  profiles.__meta__.lastAppliedConfigSnapshot = extractConfigPluginSnapshot(config);
+}
+
 function writeJsonSafe(filePath, data) {
   try {
     if (filePath === CONFIG_FILE) {
@@ -692,8 +712,13 @@ function getSystemState(query = {}) {
 
     if (lastActiveId !== activeProjectId) {
       const noExplicitContext = !convId && !clientProjectId && !clientWorkspaceUri && !token;
-      if ((isPassive || noExplicitContext) && lastActiveId) {
-        // 禁止在被动心跳或无上下文探活中执行分支 A 的跨项目 config.json 覆写与 lastActiveProjectId 篡改！
+      if (isPassive && noExplicitContext && lastActiveId) {
+        // 纯无上下文被动探活：跳过写盘，但返回的 installedPlugins 内存态必须对齐 activeProfile，绝不将旧项目的 config.json 透传给前端
+        for (const p of installedPlugins) {
+          if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
+            p.enabled = Boolean(activeProfile.plugins[p.dir]);
+          }
+        }
       } else {
         // 分支 A：跨项目切换跃变！正向将该项目的独立配置写入 config.json
         if (!config.plugins) config.plugins = {};
@@ -715,31 +740,61 @@ function getSystemState(query = {}) {
         if (configChanged) {
           writeJsonSafe(CONFIG_FILE, config);
           notifyLanguageServer(rpcUpdates);
-          // 同步更新 installedPlugins 内存显示
-          for (const p of installedPlugins) {
-            if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
-              p.enabled = Boolean(activeProfile.plugins[p.dir]);
-            }
+        }
+
+        // 无论 config.json 是否有差异，均强制同步更新 installedPlugins 内存显示与快照
+        for (const p of installedPlugins) {
+          if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
+            p.enabled = Boolean(activeProfile.plugins[p.dir]);
           }
         }
 
+        recordConfigWriteMeta(profiles, config);
         profiles.__meta__.lastActiveProjectId = activeProjectId;
         profilesModified = true;
       }
     } else {
-      // 分支 B：停留在同一项目内！检测用户在 Antigravity 软件原生设置中的变动，反向同步进 activeProfile
-      // 防护栏：若 5 秒内刚发生过后台 Hook 切换（lastBgHookAt），禁止把后台临时状态反向写回当前项目 Profile
+      // 分支 B：停留在同一项目内！通过比对 lastAppliedConfigSnapshot 区分「用户在软件原生设置中手动改开关」与「跨项目残留状态」
       const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
-      if (Date.now() - lastBgHookAt > 5000) {
+      const lastInternalWriteAt = Math.max(
+        lastInternalConfigWriteMs,
+        Number(profiles.__meta__.lastInternalConfigWriteAt || 0),
+        lastBgHookAt
+      );
+      if (Date.now() - lastInternalWriteAt > 2500) {
+        const snap = profiles.__meta__.lastAppliedConfigSnapshot || null;
         let profileChanged = false;
+        let configRepairNeeded = false;
+        const repairRpcUpdates = {};
+
         for (const p of installedPlugins) {
           if (p.protected) continue;
-          if (activeProfile.plugins[p.dir] !== p.enabled) {
-            activeProfile.plugins[p.dir] = p.enabled;
-            profileChanged = true;
+          const profileVal = activeProfile.plugins[p.dir] !== undefined ? Boolean(activeProfile.plugins[p.dir]) : p.enabled;
+          if (profileVal !== p.enabled) {
+            // 仅当存在基准快照且当前 config.json 与基准快照不一致时，才证明用户在 Antigravity 原生 Settings 中手动拨动了该开关
+            const divergedFromSnapshot = !snap || snap[p.dir] === undefined || Boolean(snap[p.dir]) !== p.enabled;
+            if (divergedFromSnapshot) {
+              activeProfile.plugins[p.dir] = p.enabled;
+              profileChanged = true;
+            } else {
+              // config.json 与上次本插件下发的快照相同（说明是后台其他项目的 Hook 下发残留），绝不反向污染当前项目 Profile，并主动自愈修复！
+              p.enabled = profileVal;
+              if (!config.plugins) config.plugins = {};
+              if (!config.plugins[p.dir]) config.plugins[p.dir] = {};
+              config.plugins[p.dir].enabled = profileVal;
+              repairRpcUpdates[p.dir] = { enabled: profileVal };
+              configRepairNeeded = true;
+            }
           }
         }
-        if (profileChanged) {
+
+        if (configRepairNeeded) {
+          writeJsonSafe(CONFIG_FILE, config);
+          notifyLanguageServer(repairRpcUpdates);
+          recordConfigWriteMeta(profiles, config);
+          profilesModified = true;
+        } else if (profileChanged) {
+          recordConfigWriteMeta(profiles, config);
           profilesModified = true;
         }
       }
@@ -1082,6 +1137,7 @@ async function requestHandler(req, res) {
           if (!config.plugins[pluginDir]) config.plugins[pluginDir] = {};
           config.plugins[pluginDir].enabled = Boolean(enabled);
           writeJsonSafe(CONFIG_FILE, config);
+          recordConfigWriteMeta(profiles, config);
 
           notifyLanguageServer({ [pluginDir]: { enabled: Boolean(enabled) } });
         }
@@ -1157,6 +1213,7 @@ async function requestHandler(req, res) {
             rpcUpdates[pluginDir] = { enabled: Boolean(shouldEnable) };
           }
           writeJsonSafe(CONFIG_FILE, config);
+          recordConfigWriteMeta(profiles, config);
           notifyLanguageServer(rpcUpdates);
         }
 
@@ -1238,6 +1295,7 @@ async function requestHandler(req, res) {
           if (!config.plugins[pluginDir]) config.plugins[pluginDir] = {};
           config.plugins[pluginDir].enabled = Boolean(enabled);
           writeJsonSafe(CONFIG_FILE, config);
+          recordConfigWriteMeta(profiles, config);
 
           notifyLanguageServer({ [pluginDir]: { enabled: Boolean(enabled) } });
         }
@@ -1319,6 +1377,7 @@ async function requestHandler(req, res) {
             rpcUpdates[pluginDir] = { enabled: Boolean(shouldEnable) };
           }
           writeJsonSafe(CONFIG_FILE, config);
+          recordConfigWriteMeta(profiles, config);
           notifyLanguageServer(rpcUpdates);
         }
 
@@ -1367,6 +1426,8 @@ async function requestHandler(req, res) {
         }
 
         writeJsonSafe(CONFIG_FILE, config);
+        recordConfigWriteMeta(profiles, config);
+        writeJsonSafe(PROFILES_FILE, profiles);
         notifyLanguageServer(rpcUpdates);
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1410,31 +1471,40 @@ if (PORT !== 8088) {
   }
 }
 
-// 后台监听 config.json 物理变更：支持无前端面板（如 GCP 登录或未打开右侧面板）下，在软件原生 Settings 中改开关立即同步保存到当前活跃项目档案
+// 后台监听 config.json 物理变更：仅当 config.json 相比本插件最后一次下发的快照（lastAppliedConfigSnapshot）发生真实偏离时，才认定为用户在原生 Settings 中手动拨动了开关
 try {
   fs.watchFile(CONFIG_FILE, { interval: 1000 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return;
-    // 忽略 Sidecar 自身刚写入 config.json 触发的回调
-    if (Date.now() - lastInternalConfigWriteMs < 800) return;
+    if (Date.now() - lastInternalConfigWriteMs < 2500) return;
     try {
       const profiles = readJsonSafe(PROFILES_FILE, {});
       const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
       if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return;
 
+      const lastWriteAt = Math.max(
+        lastInternalConfigWriteMs,
+        Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0),
+        Number(profiles?.__meta__?.lastBgHookAt || 0)
+      );
+      if (Date.now() - lastWriteAt < 2500) return;
+
       const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
       const activeProfile = profiles[lastActiveId];
+      const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
       let changed = false;
 
       for (const [pluginDir, pluginCfg] of Object.entries(config.plugins || {})) {
         if (PROTECTED_PLUGINS.has(pluginDir)) continue;
         const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
-        if (activeProfile.plugins[pluginDir] !== enabledInConfig) {
+        const divergedFromSnapshot = !snap || snap[pluginDir] === undefined || Boolean(snap[pluginDir]) !== enabledInConfig;
+        if (divergedFromSnapshot && activeProfile.plugins[pluginDir] !== enabledInConfig) {
           activeProfile.plugins[pluginDir] = enabledInConfig;
           changed = true;
         }
       }
 
       if (changed) {
+        recordConfigWriteMeta(profiles, config);
         writeJsonSafe(PROFILES_FILE, profiles);
         console.log(`[PluginSwitcher Sidecar] Headless sync: native Settings changes saved to project ${lastActiveId}`);
       }
