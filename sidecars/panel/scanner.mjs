@@ -299,7 +299,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = []) {
       }
 
       if (isConvSubOfWs) {
-        // 历史对话挂在父目录 Visual Studio 下，但对话本身属于子项目 Fox Server
+        // 历史对话挂在父级工作区目录下，但对话本身属于子目录项目
         activeProjectId = convProjId;
       } else if (convProj && convProj.isPureChat && !clientWorkspaceUri) {
         activeProjectId = convProjId;

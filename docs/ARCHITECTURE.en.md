@@ -1,4 +1,4 @@
-[English](ARCHITECTURE.en.md) | [Simplified Chinese](ARCHITECTURE.md)
+[English](ARCHITECTURE.en.md) | [简体中文](ARCHITECTURE.md)
 
 # Antigravity Plugin Switcher Architecture Design
 
