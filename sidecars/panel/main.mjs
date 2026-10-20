@@ -29,6 +29,13 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT || 8088);
 
+process.on("uncaughtException", (err) => {
+  console.error("[PluginSwitcher Sidecar] Uncaught exception:", err?.stack || err?.message || err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[PluginSwitcher Sidecar] Unhandled rejection:", reason);
+});
+
 async function requestHandler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = url.pathname;
@@ -209,13 +216,18 @@ async function requestHandler(req, res) {
 
   // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、passive 毫秒级直达当前 project_id）
   if (req.method === "GET" && pathname === "/api/status") {
-    const convId = url.searchParams.get("conversationId") || "";
-    const clientProjectId = url.searchParams.get("projectId") || "";
-    const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
-    const token = url.searchParams.get("token") || "";
-    const isPassive = url.searchParams.get("passive") === "1";
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, isPassive })));
+    try {
+      const convId = url.searchParams.get("conversationId") || "";
+      const clientProjectId = url.searchParams.get("projectId") || "";
+      const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
+      const token = url.searchParams.get("token") || "";
+      const isPassive = url.searchParams.get("passive") === "1";
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, isPassive })));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

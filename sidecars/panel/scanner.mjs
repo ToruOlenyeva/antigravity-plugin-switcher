@@ -17,7 +17,8 @@ import {
   resolvePluginLogoUrl,
   recordConfigWriteMeta,
   writeJsonSafe,
-  notifyLanguageServer
+  notifyLanguageServer,
+  getLastInternalConfigWriteMs
 } from "./ls-bridge.mjs";
 
 function scanAntigravityProjects() {
@@ -526,7 +527,7 @@ function getSystemState(query = {}) {
       // 分支 B：停留在同一项目内！通过比对 lastAppliedConfigSnapshot 区分「用户在软件原生设置中手动改开关」与「跨项目残留状态」
       const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
       const lastInternalWriteAt = Math.max(
-        lastInternalConfigWriteMs,
+        getLastInternalConfigWriteMs(),
         Number(profiles.__meta__.lastInternalConfigWriteAt || 0),
         lastBgHookAt
       );
