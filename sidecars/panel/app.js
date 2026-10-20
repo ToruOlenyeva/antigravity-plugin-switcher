@@ -1,6 +1,7 @@
     let savedLang = null;
     try { savedLang = localStorage.getItem("plugin_switcher_lang"); } catch (e) {}
-    let currentLang = (savedLang === "en" || savedLang === "zh") ? savedLang : "zh";
+    const defaultBrowserLang = (typeof navigator !== "undefined" && typeof navigator.language === "string" && /^zh\b/i.test(navigator.language)) ? "zh" : "en";
+    let currentLang = (savedLang === "en" || savedLang === "zh") ? savedLang : defaultBrowserLang;
     let state = {
       plugins: [],
       profiles: {},
@@ -798,7 +799,7 @@
 
               if (!res.ok) {
                 const textErr = await res.text();
-                throw new Error(`服务响应异常 (${res.status}): ${textErr}`);
+                throw new Error(`${I18N[currentLang].serverError || "Server error"} (${res.status}): ${textErr}`);
               }
 
               const data = await res.json();
@@ -814,7 +815,7 @@
                   showToast(I18N[currentLang].toastBatchSaved.replace("{count}", count));
                 }
               } else {
-                showToast(I18N[currentLang].errorModify + (data.error || "未知错误"));
+                showToast(I18N[currentLang].errorModify + (data.error || I18N[currentLang].unknownError || "Unknown error"));
                 checkbox.checked = !nextVal;
                 localEditedPlugins[p.dir] = !nextVal;
                 if (!nextVal) card.classList.remove("disabled");
@@ -861,7 +862,7 @@
 
             if (!res.ok) {
               const textErr = await res.text();
-              throw new Error(`服务响应异常 (${res.status}): ${textErr}`);
+              throw new Error(`${I18N[currentLang].serverError || "Server error"} (${res.status}): ${textErr}`);
             }
 
             const data = await res.json();
@@ -876,7 +877,7 @@
                 showToast(I18N[currentLang].toastProfileSaved);
               }
             } else {
-              showToast((I18N[currentLang].errorModify || "修改失败: ") + (data.error || "未知错误"));
+              showToast((I18N[currentLang].errorModify || "修改失败: ") + (data.error || I18N[currentLang].unknownError || "Unknown error"));
               checkbox.checked = !nextVal;
               localEditedPlugins[p.dir] = !nextVal;
               if (!nextVal) card.classList.remove("disabled");
@@ -956,7 +957,7 @@
 
           if (!res.ok) {
             const textErr = await res.text();
-            throw new Error(`服务响应异常 (${res.status}): ${textErr}`);
+            throw new Error(`${I18N[currentLang].serverError || "Server error"} (${res.status}): ${textErr}`);
           }
 
           const data = await res.json();
@@ -972,7 +973,7 @@
             updateStatusNote();
             renderPluginCards();
           } else {
-            showToast((I18N[currentLang].errorReset || "重置失败: ") + (data.error || "未知错误"));
+            showToast((I18N[currentLang].errorReset || "重置失败: ") + (data.error || I18N[currentLang].unknownError || "Unknown error"));
           }
         } catch (err) {
           showToast((I18N[currentLang].errorRequest || "请求失败: ") + err.message);
@@ -993,7 +994,7 @@
 
         if (!res.ok) {
           const textErr = await res.text();
-          throw new Error(`服务响应异常 (${res.status}): ${textErr}`);
+          throw new Error(`${I18N[currentLang].serverError || "Server error"} (${res.status}): ${textErr}`);
         }
 
         const data = await res.json();
@@ -1170,7 +1171,7 @@
           window.__syncTimer = setInterval(() => syncActiveProjectSilently("", "", true), 2500);
         }
       } catch (err) {
-        document.getElementById("uiLoadingText").textContent = "加载失败: " + err.message;
+        document.getElementById("uiLoadingText").textContent = (I18N[currentLang].loadFailed || I18N[currentLang].errorLoad || "Failed to load: ") + err.message;
       }
     }
 

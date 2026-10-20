@@ -28,7 +28,7 @@
 - <b>Inline Batch Editing</b>: Open batch edit mode directly inside the project selector dropdown. Support select all and multi-target selection to sync plugin toggles across multiple projects simultaneously.
 - <b>Dual-Way Live Sync</b>: Seamlessly connect the Antigravity host native Settings and the Sidecar panel, synchronizing toggle states in real time regardless of where the modification occurs.
 - <b>Standalone Window Mode</b>: Built-in fixed port 8088 web server allows direct control via an independent desktop app window, fully compatible with GCP remote login environments.
-- <b>Bilingual Support and Theme Adaptation</b>: Native English and Chinese runtime localization with persistent storage, matching the host dark and light color systems automatically.
+- <b>Bilingual Support and Theme Adaptation</b>: Automatically matches browser language preference on first load, native English and Chinese runtime localization with persistent storage, matching the host dark and light color systems automatically.
 
 ---
 

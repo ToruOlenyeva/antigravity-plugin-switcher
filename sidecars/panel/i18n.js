@@ -34,6 +34,9 @@
         errorModify: "修改失败: ",
         errorReset: "重置失败: ",
         errorLoad: "加载失败: ",
+        serverError: "服务响应异常",
+        unknownError: "未知错误",
+        loadFailed: "加载失败: ",
         toastLangSwitched: "已切换为中文（重开标签页可刷新外层标题）"
       },
       en: {
@@ -69,6 +72,9 @@
         errorModify: "Modification failed: ",
         errorReset: "Reset failed: ",
         errorLoad: "Load failed: ",
+        serverError: "Server error",
+        unknownError: "Unknown error",
+        loadFailed: "Failed to load: ",
         toastLangSwitched: "Switched to English (Reopen tab to refresh outer title)"
       }
     };
