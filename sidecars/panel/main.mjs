@@ -52,6 +52,12 @@ async function requestHandler(req, res) {
 
   // 0. 重启 Sidecar 容器自身（触发进程平滑终止，由 Antigravity 宿主 restart_policy: always 毫秒级重拉）
   if (req.method === "POST" && pathname === "/api/restart-sidecar") {
+    const onlyStandalone = url.searchParams.get("onlyStandalone") === "1";
+    if (onlyStandalone && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, ignored: true, reason: "already_host_sidecar" }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, message: "Sidecar restarting..." }));
     setTimeout(() => {
@@ -156,7 +162,10 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && pathname === "/") {
     const htmlPath = path.join(__dirname, "index.html");
     if (fs.existsSync(htmlPath)) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      });
       res.end(fs.readFileSync(htmlPath, "utf-8"));
     } else {
       res.writeHead(404);
@@ -169,7 +178,10 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && pathname === "/styles.css") {
     const cssPath = path.join(__dirname, "styles.css");
     if (fs.existsSync(cssPath)) {
-      res.writeHead(200, { "Content-Type": "text/css; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "text/css; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      });
       res.end(fs.readFileSync(cssPath, "utf-8"));
     } else {
       res.writeHead(404);
@@ -181,7 +193,10 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && pathname === "/i18n.js") {
     const i18nPath = path.join(__dirname, "i18n.js");
     if (fs.existsSync(i18nPath)) {
-      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      });
       res.end(fs.readFileSync(i18nPath, "utf-8"));
     } else {
       res.writeHead(404);
@@ -193,7 +208,10 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && pathname === "/app.js") {
     const appPath = path.join(__dirname, "app.js");
     if (fs.existsSync(appPath)) {
-      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      });
       res.end(fs.readFileSync(appPath, "utf-8"));
     } else {
       res.writeHead(404);
@@ -214,7 +232,7 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、passive 毫秒级直达当前 project_id）
+  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、active/passive 毫秒级直达当前 project_id）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
       const convId = url.searchParams.get("conversationId") || "";
@@ -222,9 +240,14 @@ async function requestHandler(req, res) {
       const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
       const token = url.searchParams.get("token") || "";
       const sidecarProjectId = url.searchParams.get("sidecarProjectId") || "";
-      const isPassive = url.searchParams.get("passive") === "1";
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, isPassive })));
+      const hasActiveFlag = url.searchParams.get("active") === "1";
+      const hasPassiveFlag = url.searchParams.get("passive") === "1";
+      const isPassive = hasActiveFlag ? false : hasPassiveFlag;
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate"
+      });
+      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, isPassive, hasActiveFlag })));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ error: err.message }));
@@ -393,6 +416,11 @@ async function requestHandler(req, res) {
 
         if (!profiles.__meta__) profiles.__meta__ = {};
         profiles.__meta__.lastPanelActionAt = Date.now();
+        if (currentHostActiveId && currentHostActiveId !== DEFAULT_KEY) {
+          profiles.__meta__.lastSidecarProjectId = currentHostActiveId;
+          profiles.__meta__.lastSidecarActiveAt = Date.now();
+          if (conversationId) profiles.__meta__.lastSidecarConvId = conversationId;
+        }
         if (currentHostActiveId && projectId === currentHostActiveId) {
           profiles.__meta__.lastActiveProjectId = currentHostActiveId;
         }
@@ -468,6 +496,11 @@ async function requestHandler(req, res) {
 
         if (!profiles.__meta__) profiles.__meta__ = {};
         profiles.__meta__.lastPanelActionAt = Date.now();
+        if (currentHostActiveId && currentHostActiveId !== DEFAULT_KEY) {
+          profiles.__meta__.lastSidecarProjectId = currentHostActiveId;
+          profiles.__meta__.lastSidecarActiveAt = Date.now();
+          if (conversationId) profiles.__meta__.lastSidecarConvId = conversationId;
+        }
         if (currentHostActiveId && projectId === currentHostActiveId) {
           profiles.__meta__.lastActiveProjectId = currentHostActiveId;
         }
@@ -708,7 +741,6 @@ server.listen(PORT, "127.0.0.1", () => {
 
 if (PORT !== 8088) {
   let retryCount = 0;
-  const maxRetries = 8;
   const standaloneServer = http.createServer(requestHandler);
 
   const tryBind8088 = () => {
@@ -722,21 +754,24 @@ if (PORT !== 8088) {
   };
 
   standaloneServer.on("error", (err) => {
-    if (err && err.code === "EADDRINUSE" && retryCount < maxRetries) {
+    if (err && err.code === "EADDRINUSE") {
       retryCount++;
-      console.log(`[PluginSwitcher Sidecar] Port 8088 occupied by standalone process, evicting and retrying (${retryCount}/${maxRetries})...`);
-      try {
-        const evictReq = http.request({
-          hostname: "127.0.0.1",
-          port: 8088,
-          path: "/api/restart-sidecar",
-          method: "POST",
-          timeout: 500
-        }, () => {});
-        evictReq.on("error", () => {});
-        evictReq.end();
-      } catch (e) {}
-      setTimeout(tryBind8088, 350);
+      if (retryCount === 1) {
+        try {
+          const evictReq = http.request({
+            hostname: "127.0.0.1",
+            port: 8088,
+            path: "/api/restart-sidecar?onlyStandalone=1",
+            method: "POST",
+            timeout: 500
+          }, () => {});
+          evictReq.on("error", () => {});
+          evictReq.end();
+        } catch (e) {}
+        setTimeout(tryBind8088, 350);
+      } else {
+        setTimeout(tryBind8088, 3000);
+      }
     } else {
       console.log(`[PluginSwitcher Sidecar] Standalone port 8088 listener notice: ${err.message}`);
     }

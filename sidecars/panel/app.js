@@ -1027,7 +1027,7 @@
     async function syncActiveProjectSilently(explicitProjectId = "", explicitWorkspaceUri = "", isPassive = false) {
       const hasExplicitPush = Boolean(explicitProjectId || explicitWorkspaceUri);
       if (!hasExplicitPush && !isPanelActuallyVisible()) return;
-      if (isSyncing) return;
+      if (isSyncing && isPassive) return;
       isSyncing = true;
       try {
         const urlParams = new URLSearchParams(window.location.search);
@@ -1045,17 +1045,42 @@
         if (isEmbeddedSidecar && lastHostActiveId && !pId) {
           queryParts.push(`sidecarProjectId=${encodeURIComponent(lastHostActiveId)}`);
         }
-        if (isPassive) queryParts.push("passive=1");
+        if (isPassive) {
+          queryParts.push("passive=1");
+        } else if (isEmbeddedSidecar) {
+          queryParts.push("active=1");
+        }
         if (queryParts.length > 0) statusUrl += `?${queryParts.join("&")}`;
 
         const res = await fetch(statusUrl);
         if (!res.ok) return;
         const latestState = await res.json();
 
+        if (latestState.bootId) {
+          if (!window.__bootId) {
+            window.__bootId = latestState.bootId;
+          } else if (window.__bootId !== latestState.bootId) {
+            window.__bootId = latestState.bootId;
+            window.location.reload();
+            return;
+          }
+        }
+
         state.projects = latestState.projects || state.projects;
         state.profiles = latestState.profiles || state.profiles;
         state.plugins = latestState.plugins || state.plugins;
         state.activeProjectId = latestState.activeProjectId || state.activeProjectId;
+
+        if (
+          isEmbeddedSidecar &&
+          isPassive &&
+          lastHostActiveId &&
+          latestState.profiles?.__meta__?.lastSidecarProjectId &&
+          latestState.profiles.__meta__.lastSidecarProjectId !== lastHostActiveId &&
+          (document.hasFocus() || document.body?.matches?.(":hover") || document.documentElement?.matches?.(":hover"))
+        ) {
+          setTimeout(() => syncActiveProjectSilently(lastHostActiveId, "", false), 20);
+        }
 
         const nextHostActiveId = latestState.activeProjectId;
         // 核心门禁：仅当宿主真实发生跨项目切换（hostActiveId 物理跃变）时，才触发自动聚焦与自动热加载！
@@ -1135,10 +1160,14 @@
         if (convId) queryParts.push(`conversationId=${encodeURIComponent(convId)}`);
         if (currentActiveWorkspaceUris.length > 0) queryParts.push(`workspaceUri=${encodeURIComponent(currentActiveWorkspaceUris.join("|"))}`);
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
+        if (isEmbeddedSidecar) queryParts.push("active=1");
         if (queryParts.length > 0) statusUrl += `?${queryParts.join("&")}`;
 
         const res = await fetch(statusUrl);
         state = await res.json();
+        if (state.bootId) {
+          window.__bootId = state.bootId;
+        }
         renderTheme(state.themeSettings);
         populateProjectDropdown();
 
@@ -1166,6 +1195,7 @@
           window.addEventListener("focus", () => syncActiveProjectSilently("", "", false));
           document.addEventListener("visibilitychange", handleVisibilityChange);
           document.addEventListener("pointerenter", () => syncActiveProjectSilently("", "", false));
+          document.addEventListener("pointerdown", () => syncActiveProjectSilently("", "", false));
 
           let wasPanelVisible = isPanelActuallyVisible();
           const checkVisibilityTransition = () => {
@@ -1207,7 +1237,6 @@
         }
 
         if (!window.__syncTimer) {
-          let lastRafPollMs = Date.now();
           window.__syncTimer = setInterval(() => {
             if (!isPanelActuallyVisible()) return;
             if (!isEmbeddedSidecar) {
@@ -1216,10 +1245,7 @@
             }
             window.requestAnimationFrame(() => {
               if (!isPanelActuallyVisible()) return;
-              const now = Date.now();
-              const justResumedFromBackground = (now - lastRafPollMs) > 4000;
-              lastRafPollMs = now;
-              syncActiveProjectSilently("", "", !justResumedFromBackground);
+              syncActiveProjectSilently("", "", true);
             });
           }, 2500);
         }

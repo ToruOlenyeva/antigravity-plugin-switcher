@@ -219,6 +219,9 @@ function resolveConvIdFromToken(token, appStorage) {
   }
 }
 
+const SIDECAR_BOOT_ID = String(Date.now());
+const instancePollTracker = new Map();
+
 let lastIdeContext = {
   activeProjectId: "",
   effectiveConvId: "",
@@ -370,6 +373,7 @@ function getSystemState(query = {}) {
   let token = "";
   let sidecarProjectId = "";
   let isPassive = false;
+  let hasActiveFlag = false;
 
   if (typeof query === "string") {
     convId = query;
@@ -380,6 +384,7 @@ function getSystemState(query = {}) {
     token = query.token || "";
     sidecarProjectId = query.sidecarProjectId || "";
     isPassive = query.isPassive === true;
+    hasActiveFlag = query.hasActiveFlag === true;
   }
   const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
   const rawProfiles = readJsonSafe(PROFILES_FILE, {});
@@ -402,19 +407,27 @@ function getSystemState(query = {}) {
     };
   }
 
-  // 2. 清洗 profiles：剔除所有基于磁盘物理路径的冗余顶层 Key，仅保留真实项目 UUID 和特殊 Key
+  const projects = scanAntigravityProjects();
+  const validProjectIds = new Set(projects.map(p => p.id));
+
+  // 2. 清洗 profiles：剔除所有基于磁盘物理路径的冗余顶层 Key 与伪插件 Sidecar 残留项，仅保留真实项目 UUID 和特殊 Key
   const profiles = {};
   let profilesModified = false;
   for (const [k, v] of Object.entries(rawProfiles)) {
-    if (k === DEFAULT_KEY || k === "__meta__" || /^[0-9a-f-]{36}$/i.test(k)) {
+    if (k === DEFAULT_KEY || k === "__meta__") {
       profiles[k] = v;
+    } else if (/^[0-9a-f-]{36}$/i.test(k)) {
+      const isBogusSidecarEntry = (!Array.isArray(v?.paths) || v.paths.length === 0) && typeof v?.name === "string" && v.name.includes("/") && !validProjectIds.has(k);
+      if (!isBogusSidecarEntry) {
+        profiles[k] = v;
+      } else {
+        profilesModified = true;
+      }
     } else {
       // 检测到存量路径冗余 Key，标记需要覆写落盘净化
       profilesModified = true;
     }
   }
-
-  const projects = scanAntigravityProjects();
   const defaultPlugins = profiles[DEFAULT_KEY].plugins || {};
 
   // 3. 彻底独立隔离：为每个真实项目建立独立的深拷贝 Profile
@@ -500,16 +513,51 @@ function getSystemState(query = {}) {
     profiles.__meta__
   );
 
-  // 识别是否为后台隐藏对话标签页发出的被动轮询（由前端 rAF 硬件级帧暂停门禁拦截后台标签页，此处仅在另一实例刚触发显式焦点交互的 2s 保护期内忽略旧被动包）
+  // 识别是否为后台隐藏对话标签页发出的被动轮询，同时通过帧率节流追踪识别当前真正处于前台可见状态的内置 Sidecar
   const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
+  const now = Date.now();
+  const instanceKey = token || effectiveConvId || activeWorkspace || activeProjectId || "";
+  let deltaMs = 0;
+  let fastTicks = 0;
+
+  if (hasExplicitContext && instanceKey) {
+    const prevTrack = instancePollTracker.get(instanceKey) || { lastAt: 0, fastTicks: 0 };
+    deltaMs = prevTrack.lastAt ? (now - prevTrack.lastAt) : 0;
+    if (deltaMs >= 1500 && deltaMs <= 3700) {
+      fastTicks = prevTrack.fastTicks + 1;
+    } else if (deltaMs > 3800) {
+      fastTicks = 0;
+    } else {
+      fastTicks = prevTrack.fastTicks;
+    }
+    instancePollTracker.set(instanceKey, { lastAt: now, fastTicks });
+
+    // 兼容尚未刷新脚本的存量 webview：当后台隐藏标签页被 Chromium 节流（间隔 > 3800ms）且携带 sidecarProjectId 但无显式 active=1 时，强制修正为被动后台轮询
+    if (!hasActiveFlag && !isPassive && sidecarProjectId && deltaMs > 3800) {
+      isPassive = true;
+    }
+  }
+
   let isBackgroundTabPassive = false;
   if (isPassive && hasExplicitContext) {
     const lastToken = profiles.__meta__.lastSidecarToken || "";
     const lastConv = profiles.__meta__.lastSidecarConvId || "";
-    const isDifferentInstance = (token && lastToken && token !== lastToken) || (effectiveConvId && lastConv && effectiveConvId !== lastConv);
+    const lastProj = profiles.__meta__.lastSidecarProjectId || "";
+    const isDifferentInstance =
+      (token && lastToken && token !== lastToken) ||
+      (effectiveConvId && lastConv && effectiveConvId !== lastConv) ||
+      (lastProj && activeProjectId && activeProjectId !== lastProj);
+
     if (isDifferentInstance) {
-      const recentlyActivated = (Date.now() - Number(profiles.__meta__.lastSidecarActiveAt || 0)) < 2000;
-      if (recentlyActivated) {
+      const lastActiveKey = lastToken || lastConv || profiles.__meta__.lastSidecarWorkspace || lastProj;
+      const lastActiveTrack = lastActiveKey ? instancePollTracker.get(lastActiveKey) : null;
+      const prevInstanceSilentMs = lastActiveTrack ? (now - lastActiveTrack.lastAt) : Infinity;
+      const sinceLastActiveMs = now - Number(profiles.__meta__.lastSidecarActiveAt || 0);
+
+      // 仅当先前的实例已退入后台静默（> 3800ms）且当前实例正在前台以 2.5s 正常帧率连续活跃心跳时，才允许被动轮询接管前台项目
+      if (fastTicks >= 1 && prevInstanceSilentMs > 3800 && sinceLastActiveMs > 2800) {
+        isBackgroundTabPassive = false;
+      } else {
         isBackgroundTabPassive = true;
       }
     }
@@ -518,7 +566,7 @@ function getSystemState(query = {}) {
   // 同步记录内置 Sidecar 的项目输出与会话映射，供 8088 外部浏览器 1:1 镜像复用
   if (hasExplicitContext && !isBackgroundTabPassive && activeProjectId && activeProjectId !== DEFAULT_KEY) {
     if (!isPassive) {
-      profiles.__meta__.lastSidecarActiveAt = Date.now();
+      profiles.__meta__.lastSidecarActiveAt = now;
     }
     if (
       profiles.__meta__.lastSidecarProjectId !== activeProjectId ||
@@ -536,7 +584,7 @@ function getSystemState(query = {}) {
       activeProjectId,
       effectiveConvId,
       workspaceUri: activeWorkspace,
-      updatedAt: Date.now()
+      updatedAt: now
     };
   }
   if (
@@ -661,6 +709,7 @@ function getSystemState(query = {}) {
   const userSettings = config.userSettings || {};
 
   return {
+    bootId: SIDECAR_BOOT_ID,
     plugins: installedPlugins,
     profiles,
     projects,
