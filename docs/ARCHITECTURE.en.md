@@ -91,24 +91,38 @@ When the client detects a session without any physical workspace paths (<code>cl
 ### Tier 4: Global Default Profile Fallback
 - If all previous tiers fail to resolve a matching project, the system safely falls back to the global baseline configuration (<code>__default__</code>), ensuring uninterrupted operations.
 
-## 3. Dual-Way Synchronization Engine and Concurrency
+## 3. Dual-Way Sync Engine, Concurrency Isolation, and Dual-Output Mirroring
 
-### 3.1 Five-Second UI Debounce Lock
-To prevent background polling from rolling back optimistic state while the user is interacting with toggles:
-- Any user toggle triggers an immediate optimistic update and sets a 5-second debounce lock.
-- While the lock is active, background synchronization checks are suppressed until disk persistence stabilizes.
+### 3.1 Three-Tier Physical Isolation for Concurrent Background Project A and Foreground Project B
+Because the Antigravity host shares a single global <code>~/.gemini/config/config.json</code> and Language Server state, the system enforces three physical isolation barriers so that <b>when Project A is running a background task while the user switches to Project B in the foreground, Project A strictly uses its own plugin configuration (never adopting Project B's plugins) and never pollutes Project B's profile</b>:
+1. <b>Barrier 1: Per-Turn Identity Self-Verification and Instant Correction (<code>auto-switch.cjs</code>)</b>
+   - Whenever background Project A starts an agent turn (<code>BeforeAgent</code> / <code>PreInvocation</code>) or invokes any tool (<code>PreToolUse</code>), <code>auto-switch.cjs</code> intercepts the lifecycle payload.
+   - <b>Foreground Focus Ban in PreToolUse</b>: In <code>pre-tool</code> mode, the hook is <b>strictly forbidden</b> from reading the foreground window focus (<code>projectsConversationOrder[0]</code> in <code>app_storage.json</code>). Instead, it extracts the task's own <code>conversationId</code> / <code>transcriptPath</code> UUID and tool target paths (<code>TargetFile</code> / <code>cwd</code>) directly from the hook payload, cross-referencing <code>convProjectMap</code> and <code>conversation_summaries.db</code> to verify that the executing task belongs to Project A.
+   - <b>Sub-Millisecond Pre-Execution Restore</b>: If global <code>config.json</code> was switched to Project B by foreground browsing, <code>auto-switch.cjs</code> atomically restores <code>profiles[A].plugins</code> into <code>config.json</code> and dispatches Language Server RPC updates right before Project A's step executes.
+2. <b>Barrier 2: One-Way Authority Invariant (Profile to Config Only)</b>
+   - <code>auto-switch.cjs</code> strictly performs one-way application (<code>profiles[projectId] -> config.json</code>) and never copies <code>config.json</code> back into <code>project-plugin-profiles.json</code>, preventing stale plugin states from contaminating another project's saved profile during rapid switching.
+3. <b>Barrier 3: Config Snapshot Diffing and Background Hook Cooldown Lock (<code>lastAppliedConfigSnapshot</code> + <code>lastBgHookAt</code>)</b>
+   - When background Project A's hook updates <code>config.json</code>, it records the exact state snapshot in <code>__meta__.lastAppliedConfigSnapshot</code> along with <code>__meta__.lastBgHookAt</code> inside <code>project-plugin-profiles.json</code>.
+   - The foreground Sidecar panel viewing Project B compares <code>config.json</code> against <code>lastAppliedConfigSnapshot</code>. Finding an exact match (<code>divergedFromSnapshot === false</code>), it recognizes that <code>config.json</code> was modified by a background project hook rather than a manual toggle in Antigravity's native Settings UI. Consequently, Project B <b>refuses to overwrite its own profile with Project A's state</b> and automatically self-heals <code>config.json</code> back to Project B when appropriate.
+   - Conversely, only when a user manually toggles a plugin inside Antigravity's native Settings UI (causing <code>divergedFromSnapshot === true</code> after the <code>2.5s</code> cooldown window) will <code>scanner.mjs</code> and <code>main.mjs</code>'s <code>fs.watchFile(CONFIG_FILE)</code> persist that manual change into the active project's profile.
 
-### 3.2 Dual-Way Synchronization
-- <b>Branch A: Workspace Switch Overwrite</b>
-  When switching projects via the dashboard or host window, the Sidecar reads target configurations, writes to <code>config.json</code>, and dispatches JSON-RPC reload signals to the host Language Server.
-- <b>Branch B: Native Settings Reverse Sync</b>
-  Using <code>fs.watchFile(CONFIG_FILE)</code>, the Sidecar observes configuration edits made inside the native Settings UI. Using write timestamps to prevent recursive self-updates, modifications are stored back into the active workspace profile.
+### 3.2 Decoupling Host Active Project (<code>●</code>) from Dropdown Viewed/Edited Profile
+- <b>Separation of Active Indicator and Dropdown Selection</b>:
+  - The green dot <code>●</code> permanently marks the <b>host's currently active project</b> (<code>state.activeProjectId</code>);
+  - The dropdown selection (<code>currentSelectedId</code>) represents the <b>target project currently viewed or pre-edited in the panel</b>.
+- <b>Uninterrupted Cross-Project Pre-Editing</b>: When the host is in Project B but the user selects Project C in the dropdown to configure switches:
+  - Toggling switches in Project C saves silently to <code>profiles[C]</code> ("Saved to project profile (will take effect when switching to it)") <b>without altering <code>config.json</code> used by active Project B</b>;
+  - Toggling switches on the active Project B (marked with <code>●</code>) or <code>__default__</code> immediately updates <code>config.json</code> and triggers Language Server RPC live reload via <code>ls-bridge.mjs</code>;
+  - The background <code>2.5s</code> heartbeat (<code>syncActiveProjectSilently</code>) <b>only auto-switches the dropdown when the host active project genuinely transitions (<code>nextHostActiveId !== lastHostActiveId</code>)</b>, ensuring users are never yanked back while editing another project's preset.
 
-### 3.3 Hidden Iframe Observer Optimization
-When switching tabs in the Auxiliary Pane or collapsing the panel, the iframe container width and height drop to zero.
-An internal <code>ResizeObserver</code> monitors the dashboard viewport:
-- When dimensions drop to zero, background polling is paused.
-- When re-expanded, an instant alignment request runs, significantly reducing idle CPU and disk activity.
+### 3.3 Real-Time Dual-Output Mirroring (IDE Sidecar & <code>http://localhost:8088</code>) and Hidden Tab Anti-Preemption
+- <b>Frontend Dual-Observer Visibility Tracking (<code>ResizeObserver</code> + <code>IntersectionObserver</code>)</b>:
+  - When switching between previously loaded conversations in the Antigravity host, hidden background conversation Sidecar iframes may retain dimensions greater than 10px with <code>document.hidden === false</code>.
+  - <code>isPanelActuallyVisible()</code> combines <code>ResizeObserver</code> with <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> to detect true viewport visibility and occlusion: hidden conversation iframes immediately pause their <code>2.5s</code> polling timer, and immediately fire an active sync (<code>isPassive = false</code>) the moment they become visible again.
+- <b>Backend Disk Mirroring and Background Tab Guard (<code>isBackgroundTabPassive</code>)</b>:
+  - Whenever the visible IDE Sidecar syncs, <code>scanner.mjs</code> persists <code>__meta__.lastSidecarProjectId</code> and <code>__meta__.lastSidecarToken</code> to <code>project-plugin-profiles.json</code> on disk;
+  - If an unclosed background conversation iframe sends a passive poll (<code>passive=1</code>) with an old <code>token</code>, the backend checks <code>lastSidecarToken</code> and the focused conversation in <code>app_storage.json</code>, flags it as <code>isBackgroundTabPassive = true</code>, and prevents it from overwriting <code>lastSidecarProjectId</code>, <code>lastActiveProjectId</code>, or <code>config.json</code>;
+  - When an external browser accesses <code>http://localhost:8088</code> (without a <code>token</code>), it reads the latest <code>__meta__.lastSidecarProjectId</code> directly from disk for 1:1 real-time mirroring, while its passive polling remains strictly read-only so background tasks in Project A continue running with zero interference.
 
 ## 4. HTTP API Specifications
 

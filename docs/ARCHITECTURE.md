@@ -91,24 +91,38 @@ Sidecar 优先提取客户端请求中携带的显式参数：
 ### 级别 4：全局默认配置兜底
 - 若上述各级均未命中，系统自动回退至全局默认配置档案（<code>__default__</code>），确保系统永不崩溃。
 
-## 3. 双态同步引擎与并发安全
+## 3. 双态同步引擎、并发隔离与双输出镜像
 
-### 3.1 5 秒面板防抖锁
-为了杜绝用户在前端面板拨动开关时，后台静默轮询覆盖用户正在编辑的中间态：
-- 用户触发任何拨动操作后，前端即刻激活本地乐观更新，并启动 5 秒防抖时钟。
-- 防抖期内，所有外部静默同步回调被严格阻断，待状态完全稳态写盘后恢复监听。
+### 3.1 后台运行项目 A 与前台切换项目 B 的「真独立」三重物理隔离机制
+由于 Antigravity 宿主底层共享同一份全局 <code>~/.gemini/config/config.json</code> 与 Language Server 内存态，为了实现「<b>项目 A 在后台执行长耗时任务时，即便用户在前台切换至项目 B，后台项目 A 依然严格使用项目 A 自身的插件配置（绝不误用项目 B 的配置），同时绝不将项目 B 的预设档案污染为项目 A 的状态</b>」，系统构建了三道硬隔离防线：
+1. <b>防线 1：后台任务执行瞬间的精准身份自证与秒级纠偏（<code>auto-switch.cjs</code>）</b>
+   - 每当后台运行的项目 A 触发新一轮模型推理（<code>BeforeAgent</code> / <code>PreInvocation</code>）或即将调用任何工具（<code>PreToolUse</code>）时，钩子 <code>auto-switch.cjs</code> 立即拦截请求。
+   - <b>严禁读取前台窗口焦点</b>：在 <code>pre-tool</code> 模式下，钩子<b>绝对禁止</b>读取 <code>app_storage.json</code> 中的前台窗口焦点（<code>projectsConversationOrder[0]</code>），而是直接从当前执行任务的 Hook Payload 中提取该任务自身的会话标识（<code>conversationId</code> / <code>transcriptPath</code> UUID）与工具目标路径（<code>TargetFile</code> / <code>cwd</code>），结合 <code>convProjectMap</code> 与 <code>conversation_summaries.db</code> 精准锁定「当前正在执行的后台任务属于项目 A」。
+   - <b>执行前毫秒级刷回项目 A 配置</b>：若检测到全局 <code>config.json</code> 因用户在前台切换至项目 B 而被改写，<code>auto-switch.cjs</code> 会在项目 A 执行动作前的毫秒级瞬间，将 <code>profiles[A].plugins</code> 重新写入 <code>config.json</code> 并通过 RPC 热同步至对应 Language Server，确保后台项目 A 全程只加载自身配置。
+2. <b>防线 2：单向覆盖铁律（严禁将全局配置反向抄回预设库）</b>
+   - <code>auto-switch.cjs</code> 严格执行 <code>profiles[projectId] -> config.json</code> 的<b>单向应用</b>，绝对不会将 <code>config.json</code> 的内容反向写回 <code>project-plugin-profiles.json</code>，从根源阻断跨项目切换瞬间旧项目残留开关污染新项目档案。
+3. <b>防线 3：配置快照比对与后台 Hook 冷却锁（<code>lastAppliedConfigSnapshot</code> + <code>lastBgHookAt</code>）</b>
+   - 当后台项目 A 的钩子临时改写 <code>config.json</code> 时，会在 <code>project-plugin-profiles.json</code> 的 <code>__meta__</code> 中同步记录配置快照 <code>lastAppliedConfigSnapshot</code> 与时间戳 <code>lastBgHookAt</code>。
+   - 此时前台展示项目 B 的 Sidecar 面板通过比对发现当前 <code>config.json</code> 等于 <code>lastAppliedConfigSnapshot</code>（<code>divergedFromSnapshot === false</code>），即可精准判定该变更是由后台项目 A 的钩子触发（而非用户在 Antigravity 原生设置界面手动点击），因此<b>绝不会将项目 A 的开关状态反向覆盖进项目 B 的预设档案</b>，并在前台自愈周期内将 <code>config.json</code> 恢复为项目 B 的配置。
+   - 反之，仅当用户在 Antigravity 原生 Settings 界面真实手动拨动了插件开关（导致 <code>config.json</code> 与 <code>lastAppliedConfigSnapshot</code> 发生偏离 <code>divergedFromSnapshot === true</code>，且已渡过 <code>2.5s</code> 后台冷却窗），<code>scanner.mjs</code> 与 <code>main.mjs</code> 的 <code>fs.watchFile(CONFIG_FILE)</code> 才会将该次手动修改沉淀入当前活跃项目的专属档案。
 
-### 3.2 双态同步（双向感知）
-- <b>分支 A：跨项目切换覆写</b>
-  用户在面板切换目标项目或宿主聚焦新项目时，Sidecar 读取目标档案，写入 <code>config.json</code>，并通过内部通道向宿主 Language Server 派发 JSON-RPC 热更新指令。
-- <b>分支 B：原生设置反向同步</b>
-  通过 <code>fs.watchFile(CONFIG_FILE)</code> 毫秒级监听宿主原生设置界面的手工变更。结合内部写入时间戳比对（防自循环），将变动精准沉淀回当前活跃项目的专属档案中。
+### 3.2 面板「当前活跃项目 (<code>●</code>)」与「下拉框预览/编辑项目」解耦机制
+- <b>绿点与下拉框物理分离</b>：
+  - 绿色圆点 <code>●</code> 永远标记<b>当前 IDE 宿主所处的活跃项目</b>（<code>state.activeProjectId</code>）；
+  - 下拉框选中项（<code>currentSelectedId</code>）代表<b>用户当前在面板中查看或预编辑的目标项目</b>。
+- <b>跨项目预编辑不打断</b>：当宿主身处项目 B，但用户在面板下拉框中手动切换至项目 C 修改开关时：
+  - 修改项目 C 的开关仅静默持久化至 <code>profiles[C]</code>（提示「已保存至该项目预设（切入该项目时自动生效）」），<b>绝不改动当前活跃项目 B 正在使用的 <code>config.json</code></b>；
+  - 修改当前带绿点 <code>●</code> 的活跃项目 B（或默认配置 <code>__default__</code>）的开关时，立即写入 <code>config.json</code> 并通过 <code>ls-bridge.mjs</code> 派发 Language Server RPC 实时热重载指令（提示「已实时同步至当前活跃项目」）；
+  - 后台 <code>2.5s</code> 静默心跳（<code>syncActiveProjectSilently</code>）<b>仅在宿主活跃项目发生真实物理跃变（<code>nextHostActiveId !== lastHostActiveId</code>）时</b>才自动将下拉框跟随切换至新活跃项目；宿主未切换项目时，绝不打断用户正在跨项目预览编辑的界面。
 
-### 3.3 后台隐藏 Iframe 观察者防抢占机制
-在 Antigravity 辅助栏中，当用户切换至终端、文件树或折叠辅助栏时，Iframe 容器的尺寸将降为 0。
-前端内置 <code>ResizeObserver</code> 监听宿主视口：
-- 当检测到宽度或高度为 0 时，自动冻结所有非必要的高频轮询。
-- 重新展开至可见时，执行一次精准拉取对齐，大幅度节约系统算力与磁盘 I/O。
+### 3.3 内置 Sidecar 与外部浏览器 <code>http://localhost:8088</code> 实时双输出镜像及后台隐藏对话防抢占
+- <b>前端双观察者可见性感知（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
+  - 在 Antigravity 宿主中切换已打开过的历史对话时，后台隐藏对话标签页的 Sidecar iframe 容器尺寸可能依然大于 10px 且 <code>document.hidden === false</code>。
+  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> 实时检测视口遮挡与真实可见性：当旧对话 Sidecar iframe 退入后台被遮挡或折叠时，立即冻结其 <code>2.5s</code> 定时轮询；当用户切回该对话使面板重新可见时，立即触发一次主动同步（<code>isPassive = false</code>）。
+- <b>后端跨进程磁盘镜像与后台标签页拦截（<code>isBackgroundTabPassive</code>）</b>：
+  - 前台可见的内置 Sidecar 每次同步时，后端 <code>scanner.mjs</code> 将解析结果实时持久化至磁盘 <code>project-plugin-profiles.json</code> 的 <code>__meta__.lastSidecarProjectId</code> 与 <code>__meta__.lastSidecarToken</code>；
+  - 若后台尚未销毁的非焦点对话 iframe 发出携带旧 <code>token</code> 的被动轮询（<code>passive=1</code>），后端通过比对 <code>lastSidecarToken</code> 与 <code>app_storage.json</code> 焦点会话将其识别为 <code>isBackgroundTabPassive = true</code>，严禁其篡改 <code>lastSidecarProjectId</code>、<code>lastActiveProjectId</code> 或 <code>config.json</code>；
+  - 外部浏览器访问 <code>http://localhost:8088</code>（无 <code>token</code> 参数）时，优先从磁盘读取最新的 <code>__meta__.lastSidecarProjectId</code> 进行 1:1 实时镜像展示，且其被动轮询仅做只读对齐，绝不覆写 <code>config.json</code>，确保外部浏览器打开期间后台运行中的项目 A 同样 100% 保持独立。
 
 ## 4. HTTP API 接口规范
 
