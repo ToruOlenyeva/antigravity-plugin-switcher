@@ -493,7 +493,7 @@ function getSystemState(query = {}) {
     profiles.__meta__
   );
 
-  // 识别是否为后台隐藏对话标签页发出的被动轮询（防止后台未销毁的旧对话 iframe 覆盖当前前台对话与 8088 镜像）
+  // 识别是否为后台隐藏对话标签页发出的被动轮询（由前端 rAF 硬件级帧暂停门禁拦截后台标签页，此处仅在另一实例刚触发显式焦点交互的 2s 保护期内忽略旧被动包）
   const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
   let isBackgroundTabPassive = false;
   if (isPassive && hasExplicitContext) {
@@ -501,9 +501,8 @@ function getSystemState(query = {}) {
     const lastConv = profiles.__meta__.lastSidecarConvId || "";
     const isDifferentInstance = (token && lastToken && token !== lastToken) || (effectiveConvId && lastConv && effectiveConvId !== lastConv);
     if (isDifferentInstance) {
-      const storageFocusedConvId = getActiveConversationIdFromStorage();
-      const recentlyActivated = (Date.now() - Number(profiles.__meta__.lastSidecarActiveAt || 0)) < 3500;
-      if (recentlyActivated || !effectiveConvId || !storageFocusedConvId || effectiveConvId !== storageFocusedConvId) {
+      const recentlyActivated = (Date.now() - Number(profiles.__meta__.lastSidecarActiveAt || 0)) < 2000;
+      if (recentlyActivated) {
         isBackgroundTabPassive = true;
       }
     }

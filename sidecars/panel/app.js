@@ -15,9 +15,14 @@
     let localEditedPlugins = {};
     let resetConfirmTimer = null;
     let isViewportIntersecting = true;
+    const isEmbeddedSidecar = Boolean(
+      (typeof window !== "undefined" && window.sidecar) ||
+      (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("token"))
+    );
 
     function isPanelActuallyVisible() {
       if (document.hidden) return false;
+      if (!isEmbeddedSidecar) return true;
       if (!isViewportIntersecting) return false;
       if (window.innerWidth <= 10 || window.innerHeight <= 10) return false;
       if (!document.body || document.body.offsetWidth <= 10 || document.body.offsetHeight <= 10) return false;
@@ -1052,6 +1057,7 @@
         // 核心门禁：仅当宿主真实发生跨项目切换（hostActiveId 物理跃变）时，才触发自动聚焦与自动热加载！
         if (nextHostActiveId && nextHostActiveId !== lastHostActiveId) {
           lastHostActiveId = nextHostActiveId;
+          populateProjectDropdown();
           const select = document.getElementById("projectSelect");
           if (select && select.querySelector(`option[value="${nextHostActiveId}"]`)) {
             select.value = nextHostActiveId;
@@ -1195,7 +1201,21 @@
         }
 
         if (!window.__syncTimer) {
-          window.__syncTimer = setInterval(() => syncActiveProjectSilently("", "", true), 2500);
+          let lastRafPollMs = Date.now();
+          window.__syncTimer = setInterval(() => {
+            if (!isPanelActuallyVisible()) return;
+            if (!isEmbeddedSidecar) {
+              syncActiveProjectSilently("", "", true);
+              return;
+            }
+            window.requestAnimationFrame(() => {
+              if (!isPanelActuallyVisible()) return;
+              const now = Date.now();
+              const justResumedFromBackground = (now - lastRafPollMs) > 4000;
+              lastRafPollMs = now;
+              syncActiveProjectSilently("", "", !justResumedFromBackground);
+            });
+          }, 2500);
         }
       } catch (err) {
         document.getElementById("uiLoadingText").textContent = (I18N[currentLang].loadFailed || I18N[currentLang].errorLoad || "Failed to load: ") + err.message;

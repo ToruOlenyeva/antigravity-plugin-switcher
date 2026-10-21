@@ -8,8 +8,49 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT || 8088);
 
-const homeDir = os.homedir();
-const appDataDir = process.env.APPDATA || (process.platform === "darwin" ? path.join(homeDir, "Library", "Application Support") : path.join(homeDir, ".config"));
+// 跨账户同源解析：优先从插件自身所在的物理路径向上反推宿主用户主目录（防止桌面登录非管理员账户 toru-work 而 Antigravity 以管理员 z9685 运行时 os.homedir() 错位）
+function resolveHostHomeDir() {
+  const normalized = __dirname.replace(/\\/g, "/");
+  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
+  if (geminiIdx > 0) {
+    const candidate = path.normalize(__dirname.slice(0, geminiIdx));
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return os.homedir();
+}
+
+const homeDir = resolveHostHomeDir();
+const appDataDir = (process.platform === "win32" && fs.existsSync(path.join(homeDir, "AppData", "Roaming")))
+  ? path.join(homeDir, "AppData", "Roaming")
+  : (process.env.APPDATA || (process.platform === "darwin" ? path.join(homeDir, "Library", "Application Support") : path.join(homeDir, ".config")));
+
+// 后端核心模块热自愈监听：当 main.mjs / scanner.mjs / ls-bridge.mjs 发生磁盘更新时自动退出，由宿主 restart_policy: always 秒级重拉最新代码
+for (const backendFile of ["main.mjs", "scanner.mjs", "ls-bridge.mjs"]) {
+  const fullBackendPath = path.join(__dirname, backendFile);
+  try {
+    fs.watchFile(fullBackendPath, { interval: 1500 }, (curr, prev) => {
+      if (curr.mtimeMs !== prev.mtimeMs) {
+        console.log(`[PluginSwitcher Sidecar] Backend file ${backendFile} updated on disk, restarting sidecar...`);
+        setTimeout(() => process.exit(0), 200);
+      }
+    });
+  } catch (e) {}
+}
+
+// 若当前进程为 Antigravity 宿主拉起的内置 Sidecar（携带动态端口），自动驱逐可能霸占 8088 端口的旧独立进程，确保单进程双端口同源输出
+if (PORT !== 8088 && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+  try {
+    const evictReq = http.request({
+      hostname: "127.0.0.1",
+      port: 8088,
+      path: "/api/restart-sidecar",
+      method: "POST",
+      timeout: 600
+    }, () => {});
+    evictReq.on("error", () => {});
+    evictReq.end();
+  } catch (e) {}
+}
 
 const PLUGINS_DIR = path.join(homeDir, ".gemini", "config", "plugins");
 const CONFIG_FILE = path.join(homeDir, ".gemini", "config", "config.json");
