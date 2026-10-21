@@ -617,14 +617,16 @@ function getSystemState(query = {}) {
       updatedAt: now
     };
   }
+  const explicitConvId = convId || (token ? resolveConvIdFromToken(token, appStorage).convId : "");
+  const wsMatchedProjId = clientWorkspaceUri ? findProjectIdByWorkspaceUris(clientWorkspaceUri, projects) : "";
   if (
-    effectiveConvId &&
+    explicitConvId &&
     activeProjectId &&
     activeProjectId !== DEFAULT_KEY &&
-    (hasExplicitContext || !profiles.__meta__.convProjectMap[effectiveConvId])
+    (!wsMatchedProjId || wsMatchedProjId === activeProjectId)
   ) {
-    if (profiles.__meta__.convProjectMap[effectiveConvId] !== activeProjectId) {
-      profiles.__meta__.convProjectMap[effectiveConvId] = activeProjectId;
+    if (profiles.__meta__.convProjectMap[explicitConvId] !== activeProjectId) {
+      profiles.__meta__.convProjectMap[explicitConvId] = activeProjectId;
       const mapKeys = Object.keys(profiles.__meta__.convProjectMap);
       if (mapKeys.length > 120) {
         for (let i = 0; i < mapKeys.length - 100; i++) {

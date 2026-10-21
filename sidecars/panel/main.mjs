@@ -235,14 +235,19 @@ async function requestHandler(req, res) {
   // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、cid、active/passive 毫秒级直达当前 project_id）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
-      const convId = url.searchParams.get("conversationId") || "";
+      const isStandalone8088 = Boolean(
+        req.socket?.localPort === 8088 ||
+        (req.headers.host || "").endsWith(":8088") ||
+        (req.headers.referer || "").includes(":8088/")
+      );
+      const convId = isStandalone8088 ? "" : (url.searchParams.get("conversationId") || "");
       const clientProjectId = url.searchParams.get("projectId") || "";
-      const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
-      const token = url.searchParams.get("token") || "";
-      const sidecarProjectId = url.searchParams.get("sidecarProjectId") || "";
-      const cid = url.searchParams.get("cid") || "";
-      const hasActiveFlag = url.searchParams.get("active") === "1";
-      const hasPassiveFlag = url.searchParams.get("passive") === "1";
+      const clientWorkspaceUri = isStandalone8088 ? "" : (url.searchParams.get("workspaceUri") || "");
+      const token = isStandalone8088 ? "" : (url.searchParams.get("token") || "");
+      const sidecarProjectId = isStandalone8088 ? "" : (url.searchParams.get("sidecarProjectId") || "");
+      const cid = isStandalone8088 ? "browser_8088" : (url.searchParams.get("cid") || "");
+      const hasActiveFlag = isStandalone8088 ? false : (url.searchParams.get("active") === "1");
+      const hasPassiveFlag = isStandalone8088 ? true : (url.searchParams.get("passive") === "1");
       const isPassive = hasActiveFlag ? false : hasPassiveFlag;
       const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag });
       if (!globalThis.__switcherDebugTrace) globalThis.__switcherDebugTrace = [];

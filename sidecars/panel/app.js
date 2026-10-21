@@ -17,9 +17,9 @@
     let resetConfirmTimer = null;
     let isViewportIntersecting = true;
     const clientInstanceId = "cid_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
-    const isEmbeddedSidecar = Boolean(
-      (typeof window !== "undefined" && window.sidecar) ||
-      (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("token"))
+    const isEmbeddedSidecar = typeof window !== "undefined" && window.location.port !== "8088" && Boolean(
+      window.sidecar ||
+      new URLSearchParams(window.location.search).get("token")
     );
 
     function isPanelActuallyVisible() {
@@ -1032,10 +1032,16 @@
       isSyncing = true;
       try {
         const urlParams = new URLSearchParams(window.location.search);
-        const convId = lockedSidecarConvId || (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "";
-        const token = urlParams.get("token") || (window.sidecar && window.sidecar.token) || "";
+        const convId = isEmbeddedSidecar
+          ? (lockedSidecarConvId || (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "")
+          : "";
+        const token = isEmbeddedSidecar
+          ? (urlParams.get("token") || (window.sidecar && window.sidecar.token) || "")
+          : "";
         const pId = typeof explicitProjectId === "string" ? explicitProjectId : "";
-        const wsUri = typeof explicitWorkspaceUri === "string" && explicitWorkspaceUri ? explicitWorkspaceUri : currentActiveWorkspaceUris.join("|");
+        const wsUri = isEmbeddedSidecar
+          ? (typeof explicitWorkspaceUri === "string" && explicitWorkspaceUri ? explicitWorkspaceUri : currentActiveWorkspaceUris.join("|"))
+          : "";
 
         let statusUrl = "/api/status";
         const queryParts = [];
@@ -1047,9 +1053,9 @@
         if (isEmbeddedSidecar && lastHostActiveId && !pId) {
           queryParts.push(`sidecarProjectId=${encodeURIComponent(lastHostActiveId)}`);
         }
-        if (isPassive) {
+        if (!isEmbeddedSidecar || isPassive) {
           queryParts.push("passive=1");
-        } else if (isEmbeddedSidecar) {
+        } else {
           queryParts.push("active=1");
         }
         if (queryParts.length > 0) statusUrl += `?${queryParts.join("&")}`;
@@ -1059,6 +1065,11 @@
         const latestState = await res.json();
 
         if (latestState.bootId) {
+          if (window.__bootId && window.__bootId !== latestState.bootId) {
+            window.__bootId = latestState.bootId;
+            window.location.reload();
+            return;
+          }
           window.__bootId = latestState.bootId;
         }
 
@@ -1124,7 +1135,7 @@
 
     function handleVisibilityChange() {
       if (!document.hidden && isPanelActuallyVisible()) {
-        syncActiveProjectSilently("", "", false);
+        syncActiveProjectSilently("", "", !isEmbeddedSidecar);
       }
     }
 
@@ -1148,7 +1159,7 @@
     async function initApp(isManualRefresh = false) {
       applyI18n();
       try {
-        if (window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
+        if (isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
           try {
             const uris = await Promise.race([
               window.sidecar.getWorkspaceUris(),
@@ -1167,15 +1178,25 @@
         }
 
         const urlParams = new URLSearchParams(window.location.search);
-        const convId = (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "";
-        const token = urlParams.get("token") || (window.sidecar && window.sidecar.token) || "";
+        const explicitConvId = isEmbeddedSidecar
+          ? ((window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "")
+          : "";
+        if (explicitConvId && !lockedSidecarConvId) {
+          lockedSidecarConvId = explicitConvId;
+        }
+        const convId = lockedSidecarConvId || explicitConvId;
+        const token = isEmbeddedSidecar
+          ? (urlParams.get("token") || (window.sidecar && window.sidecar.token) || "")
+          : "";
         let statusUrl = "/api/status";
         const queryParts = [];
         if (convId) queryParts.push(`conversationId=${encodeURIComponent(convId)}`);
-        if (currentActiveWorkspaceUris.length > 0) queryParts.push(`workspaceUri=${encodeURIComponent(currentActiveWorkspaceUris.join("|"))}`);
+        if (isEmbeddedSidecar && currentActiveWorkspaceUris.length > 0) {
+          queryParts.push(`workspaceUri=${encodeURIComponent(currentActiveWorkspaceUris.join("|"))}`);
+        }
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
         if (isEmbeddedSidecar) queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
-        if (isEmbeddedSidecar && isPanelActuallyVisible() && document.hasFocus()) {
+        if (isEmbeddedSidecar && isPanelActuallyVisible()) {
           queryParts.push("active=1");
         } else {
           queryParts.push("passive=1");
@@ -1190,12 +1211,9 @@
         renderTheme(state.themeSettings);
         populateProjectDropdown();
 
-        // 记录宿主当前所处的真实项目与对话 ID
+        // 记录宿主当前所处的真实项目
         if (state.activeProjectId) {
           lastHostActiveId = state.activeProjectId;
-        }
-        if (isEmbeddedSidecar && !lockedSidecarConvId && state.activeConversationId) {
-          lockedSidecarConvId = state.activeConversationId;
         }
 
         // 仅在首次初始化或手动点击刷新时，聚焦并锁定当前宿主项目
@@ -1211,17 +1229,17 @@
         // 挂载事件监听器与轻量安全心跳（跃变门禁守门：真切项目瞬间联动，编辑其他项目绝对不打断）
         if (!window.__listenersBound) {
           window.__listenersBound = true;
-          window.addEventListener("focus", () => syncActiveProjectSilently("", "", false));
+          window.addEventListener("focus", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
           document.addEventListener("visibilitychange", handleVisibilityChange);
-          document.addEventListener("pointerenter", () => syncActiveProjectSilently("", "", false));
-          document.addEventListener("pointerdown", () => syncActiveProjectSilently("", "", false));
+          document.addEventListener("pointerenter", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
+          document.addEventListener("pointerdown", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
 
           let wasPanelVisible = isPanelActuallyVisible();
           const checkVisibilityTransition = () => {
             const isNowVisible = isPanelActuallyVisible();
             if (isNowVisible && !wasPanelVisible) {
               wasPanelVisible = true;
-              syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), false);
+              syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), !isEmbeddedSidecar);
             } else {
               wasPanelVisible = isNowVisible;
             }
@@ -1233,23 +1251,12 @@
           }
 
           if (window.IntersectionObserver) {
-            let io;
-            try {
-              io = new IntersectionObserver((entries) => {
-                for (const entry of entries) {
-                  const visible = entry.isIntersecting && entry.intersectionRatio > 0 && (entry.isVisible !== false);
-                  isViewportIntersecting = visible;
-                }
-                checkVisibilityTransition();
-              }, { threshold: [0, 0.01, 0.1], trackVisibility: true, delay: 100 });
-            } catch (e) {
-              io = new IntersectionObserver((entries) => {
-                for (const entry of entries) {
-                  isViewportIntersecting = entry.isIntersecting && entry.intersectionRatio > 0;
-                }
-                checkVisibilityTransition();
-              }, { threshold: [0, 0.01, 0.1] });
-            }
+            const io = new IntersectionObserver((entries) => {
+              for (const entry of entries) {
+                isViewportIntersecting = entry.isIntersecting && entry.intersectionRatio > 0;
+              }
+              checkVisibilityTransition();
+            }, { threshold: [0, 0.01, 0.1] });
             if (document.body) io.observe(document.body);
             else io.observe(document.documentElement);
           }
