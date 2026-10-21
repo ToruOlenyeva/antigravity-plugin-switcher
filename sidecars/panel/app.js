@@ -14,9 +14,11 @@
     let batchSelectedProjectIds = new Set();
     let localEditedPlugins = {};
     let resetConfirmTimer = null;
+    let isViewportIntersecting = true;
 
     function isPanelActuallyVisible() {
       if (document.hidden) return false;
+      if (!isViewportIntersecting) return false;
       if (window.innerWidth <= 10 || window.innerHeight <= 10) return false;
       if (!document.body || document.body.offsetWidth <= 10 || document.body.offsetHeight <= 10) return false;
       return true;
@@ -1153,18 +1155,42 @@
           document.addEventListener("pointerenter", () => syncActiveProjectSilently("", "", false));
 
           let wasPanelVisible = isPanelActuallyVisible();
+          const checkVisibilityTransition = () => {
+            const isNowVisible = isPanelActuallyVisible();
+            if (isNowVisible && !wasPanelVisible) {
+              wasPanelVisible = true;
+              lastHostActiveId = ""; // 强制对齐当前可见面板所属的项目
+              syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), false);
+            } else {
+              wasPanelVisible = isNowVisible;
+            }
+          };
+
           if (window.ResizeObserver) {
-            const ro = new ResizeObserver(() => {
-              const isNowVisible = isPanelActuallyVisible();
-              if (isNowVisible && !wasPanelVisible) {
-                wasPanelVisible = true;
-                lastHostActiveId = ""; // 强制对齐当前可见面板所属的项目
-                syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), false);
-              } else {
-                wasPanelVisible = isNowVisible;
-              }
-            });
+            const ro = new ResizeObserver(checkVisibilityTransition);
             ro.observe(document.documentElement);
+          }
+
+          if (window.IntersectionObserver) {
+            let io;
+            try {
+              io = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                  const visible = entry.isIntersecting && entry.intersectionRatio > 0 && (entry.isVisible !== false);
+                  isViewportIntersecting = visible;
+                }
+                checkVisibilityTransition();
+              }, { threshold: [0, 0.01, 0.1], trackVisibility: true, delay: 100 });
+            } catch (e) {
+              io = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                  isViewportIntersecting = entry.isIntersecting && entry.intersectionRatio > 0;
+                }
+                checkVisibilityTransition();
+              }, { threshold: [0, 0.01, 0.1] });
+            }
+            if (document.body) io.observe(document.body);
+            else io.observe(document.documentElement);
           }
         }
 

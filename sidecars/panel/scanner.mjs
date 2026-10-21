@@ -332,21 +332,21 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     activeProjectId = convProjId;
   }
 
-  // 优先级 4（8088 外部浏览器无参数访问：直接复用输出给内置 Sidecar 的项目结果）
+  // 优先级 4（8088 外部浏览器无参数访问：直接从磁盘读取内置 Sidecar 最新落盘的项目结果，跨进程 100% 同步）
   if (!activeProjectId) {
-    if (lastIdeContext.activeProjectId && projects.some(p => p.id === lastIdeContext.activeProjectId)) {
-      activeProjectId = lastIdeContext.activeProjectId;
-    } else if (meta.lastSidecarProjectId && projects.some(p => p.id === meta.lastSidecarProjectId)) {
+    if (meta.lastSidecarProjectId && projects.some(p => p.id === meta.lastSidecarProjectId)) {
       activeProjectId = meta.lastSidecarProjectId;
+    } else if (lastIdeContext.activeProjectId && projects.some(p => p.id === lastIdeContext.activeProjectId)) {
+      activeProjectId = lastIdeContext.activeProjectId;
     } else if (meta.lastActiveProjectId && projects.some(p => p.id === meta.lastActiveProjectId)) {
       activeProjectId = meta.lastActiveProjectId;
     }
   }
 
-  const effectiveConvId = convId || lastIdeContext.effectiveConvId || meta.lastSidecarConvId || "";
-  const activeWorkspace = (clientWorkspaceUri || lastIdeContext.workspaceUri || meta.lastSidecarWorkspace || "").replace(/\\/g, "/");
+  const effectiveConvId = convId || meta.lastSidecarConvId || lastIdeContext.effectiveConvId || "";
+  const activeWorkspace = (clientWorkspaceUri || meta.lastSidecarWorkspace || lastIdeContext.workspaceUri || "").replace(/\\/g, "/");
 
-  if (hasExplicitIdeContext && activeProjectId) {
+  if (hasExplicitIdeContext && activeProjectId && !params.isBackgroundTabPassive) {
     lastIdeContext = {
       activeProjectId,
       effectiveConvId,
@@ -493,19 +493,45 @@ function getSystemState(query = {}) {
     profiles.__meta__
   );
 
-  // 同步记录内置 Sidecar 的项目输出与会话映射，供 8088 外部浏览器 1:1 镜像复用
+  // 识别是否为后台隐藏对话标签页发出的被动轮询（防止后台未销毁的旧对话 iframe 覆盖当前前台对话与 8088 镜像）
   const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
-  if (hasExplicitContext && activeProjectId && activeProjectId !== DEFAULT_KEY) {
+  let isBackgroundTabPassive = false;
+  if (isPassive && hasExplicitContext) {
+    const lastToken = profiles.__meta__.lastSidecarToken || "";
+    const lastConv = profiles.__meta__.lastSidecarConvId || "";
+    const isDifferentInstance = (token && lastToken && token !== lastToken) || (effectiveConvId && lastConv && effectiveConvId !== lastConv);
+    if (isDifferentInstance) {
+      const storageFocusedConvId = getActiveConversationIdFromStorage();
+      const recentlyActivated = (Date.now() - Number(profiles.__meta__.lastSidecarActiveAt || 0)) < 3500;
+      if (recentlyActivated || !effectiveConvId || !storageFocusedConvId || effectiveConvId !== storageFocusedConvId) {
+        isBackgroundTabPassive = true;
+      }
+    }
+  }
+
+  // 同步记录内置 Sidecar 的项目输出与会话映射，供 8088 外部浏览器 1:1 镜像复用
+  if (hasExplicitContext && !isBackgroundTabPassive && activeProjectId && activeProjectId !== DEFAULT_KEY) {
+    if (!isPassive) {
+      profiles.__meta__.lastSidecarActiveAt = Date.now();
+    }
     if (
       profiles.__meta__.lastSidecarProjectId !== activeProjectId ||
       profiles.__meta__.lastSidecarConvId !== effectiveConvId ||
-      profiles.__meta__.lastSidecarWorkspace !== activeWorkspace
+      profiles.__meta__.lastSidecarWorkspace !== activeWorkspace ||
+      (token && profiles.__meta__.lastSidecarToken !== token)
     ) {
       profiles.__meta__.lastSidecarProjectId = activeProjectId;
       profiles.__meta__.lastSidecarConvId = effectiveConvId;
       profiles.__meta__.lastSidecarWorkspace = activeWorkspace;
+      if (token) profiles.__meta__.lastSidecarToken = token;
       profilesModified = true;
     }
+    lastIdeContext = {
+      activeProjectId,
+      effectiveConvId,
+      workspaceUri: activeWorkspace,
+      updatedAt: Date.now()
+    };
   }
   if (
     effectiveConvId &&
@@ -533,8 +559,8 @@ function getSystemState(query = {}) {
 
     if (lastActiveId !== activeProjectId) {
       const noExplicitContext = !convId && !clientProjectId && !clientWorkspaceUri && !token;
-      if (isPassive && noExplicitContext && lastActiveId) {
-        // 纯无上下文被动探活：跳过写盘，但返回的 installedPlugins 内存态必须对齐 activeProfile，绝不将旧项目的 config.json 透传给前端
+      if ((isPassive && noExplicitContext && lastActiveId) || isBackgroundTabPassive) {
+        // 纯无上下文被动探活（如 8088 轮询）或后台隐藏标签页轮询：跳过写盘，仅对齐返回的内存态，绝不覆写 config.json 干扰前台项目或后台运行任务
         for (const p of installedPlugins) {
           if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
             p.enabled = Boolean(activeProfile.plugins[p.dir]);
