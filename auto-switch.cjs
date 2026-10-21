@@ -390,6 +390,34 @@ async function main() {
       metaChanged = true;
     }
 
+    // 检测当前触发 Hook 的会话是否为「后台运行对话」（前台已切换到其他项目）
+    let storageHeadConvId = "";
+    try {
+      const storage = readJsonSafe(appStoragePath, null);
+      if (storage && storage.projectsConversationOrder) {
+        const order = typeof storage.projectsConversationOrder === "string"
+          ? JSON.parse(storage.projectsConversationOrder)
+          : storage.projectsConversationOrder;
+        if (Array.isArray(order) && order.length > 0 && typeof order[0] === "string") {
+          storageHeadConvId = order[0];
+        }
+      }
+    } catch (e) {}
+
+    const foregroundSidecarProjId = profiles.__meta__.lastSidecarProjectId || "";
+    const isBackgroundConv = Boolean(
+      (payloadConvId && storageHeadConvId && payloadConvId !== storageHeadConvId) ||
+      (foregroundSidecarProjId && foregroundSidecarProjId !== activeProjectId && payloadConvId && payloadConvId !== profiles.__meta__.lastSidecarConvId)
+    );
+
+    // 若为后台对话的 pre-tool 调用，绝对不篡改前台活跃项目 ID 与全局 config.json，防止前台面板跳回后台项目
+    if (isBackgroundConv && hookMode === "pre-tool") {
+      if (metaChanged) {
+        try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
+      }
+      return reply(defaultReply);
+    }
+
     // 无论 lastActiveId 是否等于 activeProjectId，Hook 一律以 matchedProfile.plugins 为唯一权威真源正向校验 config.json
     // 绝不在 Hook 中用 config.json 反向覆盖 matchedProfile.plugins，彻底杜绝前后台切换时相互污染 Profile！
     let hasDiff = false;
@@ -411,7 +439,9 @@ async function main() {
     }
 
     if (lastActiveId !== activeProjectId || hasDiff) {
-      profiles.__meta__.lastActiveProjectId = activeProjectId;
+      if (!isBackgroundConv) {
+        profiles.__meta__.lastActiveProjectId = activeProjectId;
+      }
       profiles.__meta__.lastBgHookAt = Date.now();
       profiles.__meta__.lastInternalConfigWriteAt = Date.now();
       const snap = {};

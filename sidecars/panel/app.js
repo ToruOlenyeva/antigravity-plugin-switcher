@@ -16,6 +16,7 @@
     let localEditedPlugins = {};
     let resetConfirmTimer = null;
     let isViewportIntersecting = true;
+    const clientInstanceId = "cid_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
     const isEmbeddedSidecar = Boolean(
       (typeof window !== "undefined" && window.sidecar) ||
       (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("token"))
@@ -1042,6 +1043,7 @@
         if (pId) queryParts.push(`projectId=${encodeURIComponent(pId)}`);
         if (wsUri) queryParts.push(`workspaceUri=${encodeURIComponent(wsUri)}`);
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
+        if (isEmbeddedSidecar) queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
         if (isEmbeddedSidecar && lastHostActiveId && !pId) {
           queryParts.push(`sidecarProjectId=${encodeURIComponent(lastHostActiveId)}`);
         }
@@ -1057,13 +1059,7 @@
         const latestState = await res.json();
 
         if (latestState.bootId) {
-          if (!window.__bootId) {
-            window.__bootId = latestState.bootId;
-          } else if (window.__bootId !== latestState.bootId) {
-            window.__bootId = latestState.bootId;
-            window.location.reload();
-            return;
-          }
+          window.__bootId = latestState.bootId;
         }
 
         state.projects = latestState.projects || state.projects;
@@ -1094,13 +1090,24 @@
             onSelectProject();
             showToast(I18N[currentLang].toastAutoApplied);
           }
-        } else if (!isBatchMode && currentSelectedId === latestState.activeProjectId) {
-          // 核心双向感知：当宿主未切换项目，但用户在软件原生设置中拨动了开关时，实时同步更新面板开关！
+        } else if (!isBatchMode) {
+          // 核心双向感知：当宿主未切换项目，但在另一端面板或原生设置中拨动了开关时，实时同步更新当前选中项目开关！
           let hasDiff = false;
-          for (const p of (latestState.plugins || [])) {
-            if (localEditedPlugins[p.dir] !== p.enabled) {
-              hasDiff = true;
-              localEditedPlugins[p.dir] = p.enabled;
+          if (currentSelectedId === latestState.activeProjectId) {
+            for (const p of (latestState.plugins || [])) {
+              if (localEditedPlugins[p.dir] !== p.enabled) {
+                hasDiff = true;
+                localEditedPlugins[p.dir] = p.enabled;
+              }
+            }
+          } else if (latestState.profiles && latestState.profiles[currentSelectedId] && latestState.profiles[currentSelectedId].plugins) {
+            const profPlugins = latestState.profiles[currentSelectedId].plugins;
+            for (const p of (latestState.plugins || [])) {
+              const targetVal = p.protected ? true : (profPlugins[p.dir] !== undefined ? Boolean(profPlugins[p.dir]) : p.enabled);
+              if (localEditedPlugins[p.dir] !== targetVal) {
+                hasDiff = true;
+                localEditedPlugins[p.dir] = targetVal;
+              }
             }
           }
           if (hasDiff) {
@@ -1143,11 +1150,18 @@
       try {
         if (window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
           try {
-            const uris = await window.sidecar.getWorkspaceUris();
+            const uris = await Promise.race([
+              window.sidecar.getWorkspaceUris(),
+              new Promise(resolve => setTimeout(() => resolve(null), 300))
+            ]);
             if (Array.isArray(uris) && uris.length > 0) {
               currentActiveWorkspaceUris = uris.filter(Boolean);
+              try { sessionStorage.setItem("ps_cached_ws_uris", JSON.stringify(currentActiveWorkspaceUris)); } catch (e) {}
             } else {
-              currentActiveWorkspaceUris = [];
+              try {
+                const cached = JSON.parse(sessionStorage.getItem("ps_cached_ws_uris") || "[]");
+                if (Array.isArray(cached) && cached.length > 0) currentActiveWorkspaceUris = cached;
+              } catch (e) {}
             }
           } catch (e) {}
         }
@@ -1160,7 +1174,12 @@
         if (convId) queryParts.push(`conversationId=${encodeURIComponent(convId)}`);
         if (currentActiveWorkspaceUris.length > 0) queryParts.push(`workspaceUri=${encodeURIComponent(currentActiveWorkspaceUris.join("|"))}`);
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
-        if (isEmbeddedSidecar) queryParts.push("active=1");
+        if (isEmbeddedSidecar) queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
+        if (isEmbeddedSidecar && isPanelActuallyVisible() && document.hasFocus()) {
+          queryParts.push("active=1");
+        } else {
+          queryParts.push("passive=1");
+        }
         if (queryParts.length > 0) statusUrl += `?${queryParts.join("&")}`;
 
         const res = await fetch(statusUrl);

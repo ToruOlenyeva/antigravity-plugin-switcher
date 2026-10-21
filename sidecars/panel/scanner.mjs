@@ -299,10 +299,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
   let activeProjectId = "";
 
   // 智能协同裁决（优先级 2 & 3）
-  // 若内置 Sidecar 已在首次挂载或宿主通知中锁定自身项目（sidecarProjectId），且当前无显式 workspaceUri 跃变，直接优先采信内置面板当前展示的项目，避免多对话共享 token 时被 app_storage.json 的旧排序误导
-  if (sidecarProjectId && !wsProjId && projects.some(p => p.id === sidecarProjectId)) {
-    activeProjectId = sidecarProjectId;
-  } else if (convProjId && wsProjId) {
+  if (convProjId && wsProjId) {
     if (convProjId === wsProjId) {
       activeProjectId = convProjId;
     } else {
@@ -338,9 +335,11 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     activeProjectId = wsProjId;
   } else if (convProjId) {
     activeProjectId = convProjId;
+  } else if (sidecarProjectId && projects.some(p => p.id === sidecarProjectId)) {
+    activeProjectId = sidecarProjectId;
   }
 
-  // 优先级 4（8088 外部浏览器无参数访问：直接从磁盘读取内置 Sidecar 最新落盘的项目结果，跨进程 100% 同步）
+  // 优先级 4（8088 外部浏览器无参数访问：结合 app_storage 活跃对话头与内置 Sidecar 最新落盘结果，跨进程 100% 同步）
   if (!activeProjectId) {
     if (meta.lastSidecarProjectId && projects.some(p => p.id === meta.lastSidecarProjectId)) {
       activeProjectId = meta.lastSidecarProjectId;
@@ -353,6 +352,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
 
   const effectiveConvId = convId || meta.lastSidecarConvId || lastIdeContext.effectiveConvId || "";
   const activeWorkspace = (clientWorkspaceUri || meta.lastSidecarWorkspace || lastIdeContext.workspaceUri || "").replace(/\\/g, "/");
+  const isNewConvoContext = Boolean(!convId && (wsProjId || tokenMatchedNewConvoProjId));
 
   if (hasExplicitIdeContext && activeProjectId && !params.isBackgroundTabPassive) {
     lastIdeContext = {
@@ -363,7 +363,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     };
   }
 
-  return { activeProjectId, effectiveConvId, activeWorkspace };
+  return { activeProjectId, effectiveConvId, activeWorkspace, isNewConvoContext };
 }
 
 function getSystemState(query = {}) {
@@ -372,6 +372,7 @@ function getSystemState(query = {}) {
   let clientWorkspaceUri = "";
   let token = "";
   let sidecarProjectId = "";
+  let cid = "";
   let isPassive = false;
   let hasActiveFlag = false;
 
@@ -383,6 +384,7 @@ function getSystemState(query = {}) {
     clientWorkspaceUri = query.clientWorkspaceUri || query.workspaceUri || "";
     token = query.token || "";
     sidecarProjectId = query.sidecarProjectId || "";
+    cid = query.cid || "";
     isPassive = query.isPassive === true;
     hasActiveFlag = query.hasActiveFlag === true;
   }
@@ -507,7 +509,35 @@ function getSystemState(query = {}) {
     profiles.__meta__.convProjectMap = {};
   }
 
-  const { activeProjectId, effectiveConvId, activeWorkspace } = resolveCurrentActiveProjectId(
+  const now = Date.now();
+  const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
+  const storageHeadConvId = getActiveConversationIdFromStorage(appStorage);
+  let storageHeadProjId = "";
+  if (storageHeadConvId) {
+    const dbId = resolveProjectIdFromDb(storageHeadConvId);
+    const mappedId = profiles.__meta__.convProjectMap[storageHeadConvId] || "";
+    const pId = (dbId && projects.some(p => p.id === dbId)) ? dbId : mappedId;
+    if (pId && projects.some(p => p.id === pId)) {
+      storageHeadProjId = pId;
+      if (profiles.__meta__.convProjectMap[storageHeadConvId] !== storageHeadProjId) {
+        profiles.__meta__.convProjectMap[storageHeadConvId] = storageHeadProjId;
+        profilesModified = true;
+      }
+    }
+  }
+
+  // 仅当 app_storage.json 的置顶会话 ID（projectsConversationOrder[0]）真实发生切换跃变时，才更新基准记录；绝不在平时轮询时用旧的 storageHeadProjId 覆盖内置 Sidecar 已切换到的项目
+  if (storageHeadConvId && storageHeadProjId && profiles.__meta__.lastStorageHeadConvId !== storageHeadConvId) {
+    const headProj = projects.find(p => p.id === storageHeadProjId);
+    profiles.__meta__.lastStorageHeadConvId = storageHeadConvId;
+    profiles.__meta__.lastSidecarProjectId = storageHeadProjId;
+    profiles.__meta__.lastSidecarConvId = storageHeadConvId;
+    profiles.__meta__.lastSidecarWorkspace = (headProj && headProj.primaryPath) || "";
+    profiles.__meta__.lastSidecarIsNewConvo = false;
+    profilesModified = true;
+  }
+
+  const { activeProjectId, effectiveConvId, activeWorkspace, isNewConvoContext } = resolveCurrentActiveProjectId(
     { convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId },
     projects,
     profiles.__meta__
@@ -515,8 +545,11 @@ function getSystemState(query = {}) {
 
   // 识别是否为后台隐藏对话标签页发出的被动轮询，同时通过帧率节流追踪识别当前真正处于前台可见状态的内置 Sidecar
   const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
-  const now = Date.now();
-  const instanceKey = token || effectiveConvId || activeWorkspace || activeProjectId || "";
+  const instanceKey = cid || token || effectiveConvId || activeWorkspace || activeProjectId || "";
+  const lastActiveKey = profiles.__meta__.lastSidecarInstanceKey || profiles.__meta__.lastSidecarToken || profiles.__meta__.lastSidecarConvId || profiles.__meta__.lastSidecarWorkspace || profiles.__meta__.lastSidecarProjectId || "";
+  const lastActiveTrackBefore = (lastActiveKey && lastActiveKey !== instanceKey) ? instancePollTracker.get(lastActiveKey) : null;
+  const prevInstanceSilentMs = lastActiveTrackBefore ? (now - lastActiveTrackBefore.lastAt) : Infinity;
+
   let deltaMs = 0;
   let fastTicks = 0;
 
@@ -532,7 +565,6 @@ function getSystemState(query = {}) {
     }
     instancePollTracker.set(instanceKey, { lastAt: now, fastTicks });
 
-    // 兼容尚未刷新脚本的存量 webview：当后台隐藏标签页被 Chromium 节流（间隔 > 3800ms）且携带 sidecarProjectId 但无显式 active=1 时，强制修正为被动后台轮询
     if (!hasActiveFlag && !isPassive && sidecarProjectId && deltaMs > 3800) {
       isPassive = true;
     }
@@ -540,22 +572,15 @@ function getSystemState(query = {}) {
 
   let isBackgroundTabPassive = false;
   if (isPassive && hasExplicitContext) {
-    const lastToken = profiles.__meta__.lastSidecarToken || "";
-    const lastConv = profiles.__meta__.lastSidecarConvId || "";
     const lastProj = profiles.__meta__.lastSidecarProjectId || "";
-    const isDifferentInstance =
-      (token && lastToken && token !== lastToken) ||
-      (effectiveConvId && lastConv && effectiveConvId !== lastConv) ||
-      (lastProj && activeProjectId && activeProjectId !== lastProj);
-
+    const isDifferentInstance = Boolean(
+      (lastActiveKey && instanceKey && instanceKey !== lastActiveKey) ||
+      (lastProj && activeProjectId && activeProjectId !== lastProj)
+    );
     if (isDifferentInstance) {
-      const lastActiveKey = lastToken || lastConv || profiles.__meta__.lastSidecarWorkspace || lastProj;
-      const lastActiveTrack = lastActiveKey ? instancePollTracker.get(lastActiveKey) : null;
-      const prevInstanceSilentMs = lastActiveTrack ? (now - lastActiveTrack.lastAt) : Infinity;
       const sinceLastActiveMs = now - Number(profiles.__meta__.lastSidecarActiveAt || 0);
-
-      // 仅当先前的实例已退入后台静默（> 3800ms）且当前实例正在前台以 2.5s 正常帧率连续活跃心跳时，才允许被动轮询接管前台项目
-      if (fastTicks >= 1 && prevInstanceSilentMs > 3800 && sinceLastActiveMs > 2800) {
+      // 当前实例正在前台以 2.5s 正常帧率连续心跳（未被 Chromium 后台隐藏标签页节流），而上一实例已静默 > 3200ms 时，立即允许接管前台项目
+      if (fastTicks >= 1 && prevInstanceSilentMs > 3200 && sinceLastActiveMs > 2000) {
         isBackgroundTabPassive = false;
       } else {
         isBackgroundTabPassive = true;
@@ -565,9 +590,14 @@ function getSystemState(query = {}) {
 
   // 同步记录内置 Sidecar 的项目输出与会话映射，供 8088 外部浏览器 1:1 镜像复用
   if (hasExplicitContext && !isBackgroundTabPassive && activeProjectId && activeProjectId !== DEFAULT_KEY) {
+    profiles.__meta__.lastSidecarPollAt = now;
     if (!isPassive) {
       profiles.__meta__.lastSidecarActiveAt = now;
     }
+    if (instanceKey) {
+      profiles.__meta__.lastSidecarInstanceKey = instanceKey;
+    }
+    profiles.__meta__.lastSidecarIsNewConvo = Boolean(isNewConvoContext);
     if (
       profiles.__meta__.lastSidecarProjectId !== activeProjectId ||
       profiles.__meta__.lastSidecarConvId !== effectiveConvId ||
@@ -612,9 +642,8 @@ function getSystemState(query = {}) {
     const activeProfile = profiles[activeProjectId];
 
     if (lastActiveId !== activeProjectId) {
-      const noExplicitContext = !convId && !clientProjectId && !clientWorkspaceUri && !token;
-      if ((isPassive && noExplicitContext && lastActiveId) || isBackgroundTabPassive) {
-        // 纯无上下文被动探活（如 8088 轮询）或后台隐藏标签页轮询：跳过写盘，仅对齐返回的内存态，绝不覆写 config.json 干扰前台项目或后台运行任务
+      if (isBackgroundTabPassive) {
+        // 后台隐藏标签页轮询：跳过写盘，仅对齐返回的内存态，绝不覆写 config.json 干扰前台项目或后台运行任务
         for (const p of installedPlugins) {
           if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
             p.enabled = Boolean(activeProfile.plugins[p.dir]);

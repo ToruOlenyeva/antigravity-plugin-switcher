@@ -232,7 +232,7 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、active/passive 毫秒级直达当前 project_id）
+  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、cid、active/passive 毫秒级直达当前 project_id）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
       const convId = url.searchParams.get("conversationId") || "";
@@ -240,18 +240,42 @@ async function requestHandler(req, res) {
       const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
       const token = url.searchParams.get("token") || "";
       const sidecarProjectId = url.searchParams.get("sidecarProjectId") || "";
+      const cid = url.searchParams.get("cid") || "";
       const hasActiveFlag = url.searchParams.get("active") === "1";
       const hasPassiveFlag = url.searchParams.get("passive") === "1";
       const isPassive = hasActiveFlag ? false : hasPassiveFlag;
+      const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag });
+      if (!globalThis.__switcherDebugTrace) globalThis.__switcherDebugTrace = [];
+      globalThis.__switcherDebugTrace.push({
+        at: new Date().toISOString(),
+        cid,
+        token: token ? token.slice(0, 8) : "",
+        convId: convId ? convId.slice(0, 8) : "",
+        ws: clientWorkspaceUri,
+        sidecarProjectId: sidecarProjectId ? sidecarProjectId.slice(0, 8) : "",
+        isPassive,
+        hasActiveFlag,
+        resolvedActiveProjectId: stateData.activeProjectId,
+        resolvedConvId: stateData.activeConversationId
+      });
+      if (globalThis.__switcherDebugTrace.length > 60) {
+        globalThis.__switcherDebugTrace.shift();
+      }
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "no-store, no-cache, must-revalidate"
       });
-      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, isPassive, hasActiveFlag })));
+      res.end(JSON.stringify(stateData));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ error: err.message }));
     }
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/debug-trace") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(globalThis.__switcherDebugTrace || [], null, 2));
     return;
   }
 
