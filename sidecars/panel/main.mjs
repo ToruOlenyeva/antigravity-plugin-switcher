@@ -214,16 +214,17 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、passive 毫秒级直达当前 project_id）
+  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、passive 毫秒级直达当前 project_id）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
       const convId = url.searchParams.get("conversationId") || "";
       const clientProjectId = url.searchParams.get("projectId") || "";
       const clientWorkspaceUri = url.searchParams.get("workspaceUri") || "";
       const token = url.searchParams.get("token") || "";
+      const sidecarProjectId = url.searchParams.get("sidecarProjectId") || "";
       const isPassive = url.searchParams.get("passive") === "1";
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, isPassive })));
+      res.end(JSON.stringify(getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, isPassive })));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ error: err.message }));
@@ -706,17 +707,42 @@ server.listen(PORT, "127.0.0.1", () => {
 });
 
 if (PORT !== 8088) {
-  try {
-    const standaloneServer = http.createServer(requestHandler);
-    standaloneServer.on("error", (err) => {
+  let retryCount = 0;
+  const maxRetries = 8;
+  const standaloneServer = http.createServer(requestHandler);
+
+  const tryBind8088 = () => {
+    try {
+      standaloneServer.listen(8088, "127.0.0.1", () => {
+        console.log(`[PluginSwitcher Sidecar] Dual listening enabled on http://127.0.0.1:8088`);
+      });
+    } catch (e) {
+      console.log(`[PluginSwitcher Sidecar] Standalone port 8088 listen error: ${e.message}`);
+    }
+  };
+
+  standaloneServer.on("error", (err) => {
+    if (err && err.code === "EADDRINUSE" && retryCount < maxRetries) {
+      retryCount++;
+      console.log(`[PluginSwitcher Sidecar] Port 8088 occupied by standalone process, evicting and retrying (${retryCount}/${maxRetries})...`);
+      try {
+        const evictReq = http.request({
+          hostname: "127.0.0.1",
+          port: 8088,
+          path: "/api/restart-sidecar",
+          method: "POST",
+          timeout: 500
+        }, () => {});
+        evictReq.on("error", () => {});
+        evictReq.end();
+      } catch (e) {}
+      setTimeout(tryBind8088, 350);
+    } else {
       console.log(`[PluginSwitcher Sidecar] Standalone port 8088 listener notice: ${err.message}`);
-    });
-    standaloneServer.listen(8088, "127.0.0.1", () => {
-      console.log(`[PluginSwitcher Sidecar] Dual listening enabled on http://127.0.0.1:8088`);
-    });
-  } catch (e) {
-    console.log(`[PluginSwitcher Sidecar] Standalone port 8088 listen error: ${e.message}`);
-  }
+    }
+  });
+
+  tryBind8088();
 }
 
 // 后台监听 config.json 物理变更：仅当 config.json 相比本插件最后一次下发的快照（lastAppliedConfigSnapshot）发生真实偏离时，才认定为用户在原生 Settings 中手动拨动了开关

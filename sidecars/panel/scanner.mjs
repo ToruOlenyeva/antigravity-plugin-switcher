@@ -231,6 +231,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
   let clientProjectId = "";
   let clientWorkspaceUri = "";
   let token = "";
+  let sidecarProjectId = "";
 
   if (typeof params === "string") {
     convId = params;
@@ -239,9 +240,10 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     clientProjectId = params.clientProjectId || params.projectId || "";
     clientWorkspaceUri = params.clientWorkspaceUri || params.workspaceUri || "";
     token = params.token || "";
+    sidecarProjectId = params.sidecarProjectId || "";
   }
 
-  const hasExplicitIdeContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
+  const hasExplicitIdeContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
   const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
   const meta = profilesMeta || (readJsonSafe(PROFILES_FILE, {}).__meta__) || {};
   const convProjectMap = (meta && typeof meta.convProjectMap === "object") ? meta.convProjectMap : {};
@@ -294,7 +296,10 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
   let activeProjectId = "";
 
   // 智能协同裁决（优先级 2 & 3）
-  if (convProjId && wsProjId) {
+  // 若内置 Sidecar 已在首次挂载或宿主通知中锁定自身项目（sidecarProjectId），且当前无显式 workspaceUri 跃变，直接优先采信内置面板当前展示的项目，避免多对话共享 token 时被 app_storage.json 的旧排序误导
+  if (sidecarProjectId && !wsProjId && projects.some(p => p.id === sidecarProjectId)) {
+    activeProjectId = sidecarProjectId;
+  } else if (convProjId && wsProjId) {
     if (convProjId === wsProjId) {
       activeProjectId = convProjId;
     } else {
@@ -363,6 +368,7 @@ function getSystemState(query = {}) {
   let clientProjectId = "";
   let clientWorkspaceUri = "";
   let token = "";
+  let sidecarProjectId = "";
   let isPassive = false;
 
   if (typeof query === "string") {
@@ -372,6 +378,7 @@ function getSystemState(query = {}) {
     clientProjectId = query.clientProjectId || query.projectId || "";
     clientWorkspaceUri = query.clientWorkspaceUri || query.workspaceUri || "";
     token = query.token || "";
+    sidecarProjectId = query.sidecarProjectId || "";
     isPassive = query.isPassive === true;
   }
   const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
@@ -488,13 +495,13 @@ function getSystemState(query = {}) {
   }
 
   const { activeProjectId, effectiveConvId, activeWorkspace } = resolveCurrentActiveProjectId(
-    { convId, clientProjectId, clientWorkspaceUri, token },
+    { convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId },
     projects,
     profiles.__meta__
   );
 
   // 识别是否为后台隐藏对话标签页发出的被动轮询（由前端 rAF 硬件级帧暂停门禁拦截后台标签页，此处仅在另一实例刚触发显式焦点交互的 2s 保护期内忽略旧被动包）
-  const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
+  const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
   let isBackgroundTabPassive = false;
   if (isPassive && hasExplicitContext) {
     const lastToken = profiles.__meta__.lastSidecarToken || "";

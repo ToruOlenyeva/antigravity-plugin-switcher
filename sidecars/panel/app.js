@@ -10,6 +10,7 @@
     let currentSelectedId = DEFAULT_KEY;
     let isBatchMode = false;
     let lastHostActiveId = "";
+    let lockedSidecarConvId = "";
     let currentActiveWorkspaceUris = [];
     let batchSelectedProjectIds = new Set();
     let localEditedPlugins = {};
@@ -1030,7 +1031,7 @@
       isSyncing = true;
       try {
         const urlParams = new URLSearchParams(window.location.search);
-        const convId = (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "";
+        const convId = lockedSidecarConvId || (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "";
         const token = urlParams.get("token") || (window.sidecar && window.sidecar.token) || "";
         const pId = typeof explicitProjectId === "string" ? explicitProjectId : "";
         const wsUri = typeof explicitWorkspaceUri === "string" && explicitWorkspaceUri ? explicitWorkspaceUri : currentActiveWorkspaceUris.join("|");
@@ -1041,6 +1042,9 @@
         if (pId) queryParts.push(`projectId=${encodeURIComponent(pId)}`);
         if (wsUri) queryParts.push(`workspaceUri=${encodeURIComponent(wsUri)}`);
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
+        if (isEmbeddedSidecar && lastHostActiveId && !pId) {
+          queryParts.push(`sidecarProjectId=${encodeURIComponent(lastHostActiveId)}`);
+        }
         if (isPassive) queryParts.push("passive=1");
         if (queryParts.length > 0) statusUrl += `?${queryParts.join("&")}`;
 
@@ -1138,9 +1142,12 @@
         renderTheme(state.themeSettings);
         populateProjectDropdown();
 
-        // 记录宿主当前所处的真实项目
+        // 记录宿主当前所处的真实项目与对话 ID
         if (state.activeProjectId) {
           lastHostActiveId = state.activeProjectId;
+        }
+        if (isEmbeddedSidecar && !lockedSidecarConvId && state.activeConversationId) {
+          lockedSidecarConvId = state.activeConversationId;
         }
 
         // 仅在首次初始化或手动点击刷新时，聚焦并锁定当前宿主项目
@@ -1165,7 +1172,6 @@
             const isNowVisible = isPanelActuallyVisible();
             if (isNowVisible && !wasPanelVisible) {
               wasPanelVisible = true;
-              lastHostActiveId = ""; // 强制对齐当前可见面板所属的项目
               syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), false);
             } else {
               wasPanelVisible = isNowVisible;
