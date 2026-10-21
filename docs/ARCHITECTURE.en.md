@@ -69,16 +69,17 @@ plugin-switcher/
 
 To reliably determine the active project in complex host environments (multi-root workspaces, chat sessions, cloud desktops, rapid tab switching), the system implements a strict four-tier arbitration hierarchy:
 
-### Tier 1: Explicit Parameters and Direct Probing
+### Tier 1: Explicit Parameters and O(1) In-Memory Fast Path
 The Sidecar first inspects explicit parameters supplied by the client:
-- Explicit <code>conversationId</code> or <code>projectId</code>.
+- Explicit <code>conversationId</code> or <code>projectId</code> (when the frontend already holds a <code>conversationId</code>, it bypasses blocking waits on <code>window.sidecar.getWorkspaceUris()</code>, eliminating timeout stalls on directory-free sessions).
+- <b>O(1) In-Memory Map Priority (<code>convProjectMap</code> + <code>convIdProjectCache</code>)</b>: When <code>conversationId</code> is provided, the backend prioritizes O(1) lookup against <code>profiles.__meta__.convProjectMap[convId]</code> and the in-memory <code>convIdProjectCache</code> (<code>&lt; 1ms</code>), guaranteeing <code>&lt; 15ms</code> instant switching even for remote or directory-free projects.
 - When <code>token</code> is provided, it scans tabs recorded under <code>aux-pane-v2-session</code> inside <code>app_storage.json</code>.
 - If the identified parameter is a valid 36-character UUID belonging to registered projects, the resolution terminates immediately.
 
 ### Tier 2: SQLite Query and Multi-Root Path Scoring
-If explicit parameters are missing:
-- <b>Native SQLite Query</b>: Leverages <code>node:sqlite</code> to query <code>conversation_summaries.db</code> directly, resolving project bindings by the latest active timestamp.
-- <b>Longest Common Path Scoring</b>: When the client reports <code>workspaceUris</code>, the algorithm evaluates each candidate project path.
+If Tier 1 in-memory lookup misses:
+- <b>Native SQLite Query (Zero Child-Process Blocking)</b>: Leverages the persistent <code>node:sqlite</code> handle to query <code>conversation_summaries.db</code> directly and caches the result in <code>convIdProjectCache</code> (completely skipping external child-process fallbacks whenever <code>node:sqlite</code> is initialized).
+- <b>Longest Common Path Scoring</b>: For new conversations (without a <code>conversationId</code>) where the client reports <code>workspaceUris</code>, the algorithm evaluates each candidate project path.
   - An exact match yields the highest score (10000 points plus path string length).
   - A prefix match yields a score proportional to prefix string length.
   - The project with the highest cumulative score wins, cleanly resolving nested multi-root directories.
@@ -115,18 +116,19 @@ Because the Antigravity host shares a single global <code>~/.gemini/config/confi
   - Toggling switches on the active Project B (marked with <code>●</code>) or <code>__default__</code> immediately updates <code>config.json</code> and triggers Language Server RPC live reload via <code>ls-bridge.mjs</code>;
   - The background <code>2.5s</code> heartbeat (<code>syncActiveProjectSilently</code>) <b>only auto-switches the dropdown when the host active project genuinely transitions (<code>nextHostActiveId !== lastHostActiveId</code>)</b>, ensuring users are never yanked back while editing another project's preset.
 
-### 3.3 Real-Time Dual-Output Mirroring (IDE Sidecar & <code>http://localhost:8088</code>) and Hidden Tab Anti-Preemption
+### 3.3 Single-Process Dual-Port Hosting and <code>http://localhost:8088</code> Zero-Latency SSE Dual-Output Mirroring
+- <b>Cross-Account Homologous Home Resolution and Single-Process Dual-Port Binding (<code>ls-bridge.mjs</code> + <code>main.mjs</code>)</b>:
+  - To prevent <code>os.homedir()</code> mismatches when the Windows desktop session runs under a standard user account while the Antigravity host runs under an Administrator account, <code>resolveHostHomeDir()</code> derives the host user home directory directly from the physical plugin installation path, ensuring 100% homologous configuration access;
+  - When spawned by the host, a single Node.js Sidecar process simultaneously binds both the host-assigned dynamic port (<code>ANTIGRAVITY_SIDECAR_WEB_PORT</code>) and standalone port <code>8088</code> (automatically evicting any stale standalone process on port <code>8088</code> via <code>POST /api/restart-sidecar</code>), eliminating split-brain processes.
+- <b>Compute-Once, Zero-Latency Dual-Output via <code>latestDualOutputState</code> and SSE (<code>GET /api/events</code>)</b>:
+  - Whenever the built-in Sidecar requests <code>GET /api/status</code> and computes the latest <code>stateData</code>, the backend caches it in <code>latestDualOutputState</code> and broadcasts it in <code>0ms</code> via <code>broadcastStateToAllFrontends(stateData)</code> over <code>GET /api/events</code> (Server-Sent Events) to <code>http://localhost:8088</code>;
+  - External browsers on <code>http://localhost:8088</code> subscribe via <code>new EventSource("/api/events")</code> to render the exact same payload in real time, while standard <code>GET /api/status</code> polls on port <code>8088</code> directly reuse <code>latestDualOutputState.activeProjectId</code> (only falling back to the top conversation in <code>app_storage.json</code> when the built-in Sidecar has been closed or inactive for <code>&gt; 8s</code>).
 - <b>Frontend Dual-Observer Visibility Tracking (<code>ResizeObserver</code> + <code>IntersectionObserver</code>)</b>:
-  - When switching between previously loaded conversations in the Antigravity host, hidden background conversation Sidecar iframes may retain dimensions greater than 10px with <code>document.hidden === false</code>.
-  - <code>isPanelActuallyVisible()</code> combines <code>ResizeObserver</code> with <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> to detect true viewport visibility and occlusion: hidden conversation iframes immediately pause their <code>2.5s</code> polling timer, and immediately fire an active sync (<code>isPassive = false</code>) the moment they become visible again.
-- <b>Backend Disk Mirroring and Background Tab Guard (<code>isBackgroundTabPassive</code>)</b>:
-  - Whenever the visible IDE Sidecar syncs, <code>scanner.mjs</code> persists <code>__meta__.lastSidecarProjectId</code> and <code>__meta__.lastSidecarToken</code> to <code>project-plugin-profiles.json</code> on disk;
-  - If an unclosed background conversation iframe sends a passive poll (<code>passive=1</code>) with an old <code>token</code>, the backend checks <code>lastSidecarToken</code> and the focused conversation in <code>app_storage.json</code>, flags it as <code>isBackgroundTabPassive = true</code>, and prevents it from overwriting <code>lastSidecarProjectId</code>, <code>lastActiveProjectId</code>, or <code>config.json</code>;
-  - When an external browser accesses <code>http://localhost:8088</code> (without a <code>token</code>), it reads the latest <code>__meta__.lastSidecarProjectId</code> directly from disk for 1:1 real-time mirroring, while its passive polling remains strictly read-only so background tasks in Project A continue running with zero interference.
+  - <code>isPanelActuallyVisible()</code> combines <code>ResizeObserver</code> with <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> to detect true viewport visibility and occlusion: hidden conversation iframes immediately pause their <code>2.5s</code> polling timer, and immediately fire an active sync (<code>isPassive = false</code>) the moment they become visible again, driving instant simultaneous updates across both the built-in Sidecar and port <code>8088</code>.
 
 ## 4. HTTP API Specifications
 
-All endpoints are hosted locally at <code>http://127.0.0.1:8088</code>.
+All endpoints are served identically from both the host-assigned internal port and <code>http://127.0.0.1:8088</code> within the same process.
 
 ### 4.1 Get Status and Configurations
 - <b>Route</b>: <code>GET /api/status</code>
@@ -154,6 +156,11 @@ All endpoints are hosted locally at <code>http://127.0.0.1:8088</code>.
   "projects": []
 }
 ```
+
+### 4.1.1 Real-Time Dual-Output Event Stream (SSE)
+- <b>Route</b>: <code>GET /api/events</code>
+- <b>Content-Type</b>: <code>text/event-stream; charset=utf-8</code>
+- <b>Description</b>: Immediately pushes the cached <code>latestDualOutputState</code> upon connection and broadcasts the exact same <code>stateData</code> JSON frame (<code>data: {...}\n\n</code>) in <code>0ms</code> whenever the built-in Sidecar updates its state, enabling zero-latency mirroring on <code>http://localhost:8088</code>.
 
 ### 4.2 Toggle Single Plugin State
 - <b>Route</b>: <code>POST /api/set-plugin-state</code>

@@ -85,46 +85,63 @@ try {
   sqliteDb = null;
 }
 
+const convIdProjectCache = new Map();
+
 function resolveProjectIdFromDb(convId) {
   if (!convId) return "";
+  if (convIdProjectCache.has(convId)) {
+    const cached = convIdProjectCache.get(convId);
+    if (cached.projectId || (Date.now() - cached.at < 15000)) {
+      return cached.projectId;
+    }
+  }
 
-  // 1. 原生 node:sqlite 毫秒级直查
+  // 1. 原生 node:sqlite 毫秒级直查（命中则立即缓存并返回；未命中时绝不重复拉起 python 查同一库）
   if (sqliteDb) {
     try {
       const stmt = sqliteDb.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?");
       const row = stmt.get(convId);
-      if (row && row.project_id) {
-        return row.project_id;
+      const pId = (row && row.project_id) ? String(row.project_id) : "";
+      if (pId) {
+        convIdProjectCache.set(convId, { projectId: pId, at: Date.now() });
+        return pId;
+      }
+    } catch (e) {}
+  } else {
+    // 2. 仅当当前 Node 运行时不支持 node:sqlite (sqliteDb === null) 时才使用一次 Python 兜底
+    try {
+      if (fs.existsSync(CONV_DB_PATH)) {
+        const pyScript = "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); c = conn.cursor(); c.execute('SELECT project_id FROM conversation_summaries WHERE conversation_id = ?', (sys.argv[2],)); r = c.fetchone(); print(r[0] if r else '')";
+        const out = execFileSync("python", ["-c", pyScript, CONV_DB_PATH, convId], {
+          encoding: "utf-8",
+          timeout: 400,
+          windowsHide: true
+        });
+        const pId = out.trim();
+        if (pId) {
+          convIdProjectCache.set(convId, { projectId: pId, at: Date.now() });
+          return pId;
+        }
       }
     } catch (e) {}
   }
 
-  // 2. Python sqlite3 兜底直查（如果原生未就绪）
-  try {
-    if (fs.existsSync(CONV_DB_PATH)) {
-      const pyScript = "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); c = conn.cursor(); c.execute('SELECT project_id FROM conversation_summaries WHERE conversation_id = ?', (sys.argv[2],)); r = c.fetchone(); print(r[0] if r else '')";
-      const out = execFileSync("python", ["-c", pyScript, CONV_DB_PATH, convId], {
-        encoding: "utf-8",
-        timeout: 1000,
-        windowsHide: true
-      });
-      const pId = out.trim();
-      if (pId) return pId;
-    }
-  } catch (e) {}
-
-  // 3. agentapi CLI 官方探测兜底
+  // 3. agentapi CLI 官方探测兜底（仅对尚未入 SQLite 的纯聊天/新会话执行一次，结果写入 convIdProjectCache 防止重复阻塞）
   try {
     const exe = process.env.ANTIGRAVITY_AGENTAPI_EXE;
     const file = exe || "agentapi";
     const args = exe ? ["agentapi", "get-conversation-metadata", convId] : ["get-conversation-metadata", convId];
-    const out = execFileSync(file, args, { encoding: "utf-8", timeout: 1000, windowsHide: true });
+    const out = execFileSync(file, args, { encoding: "utf-8", timeout: 450, windowsHide: true });
     const json = JSON.parse(out);
     const meta = json?.response?.conversationMetadata?.metadata || json?.response?.conversation_metadata?.metadata;
     const pId = meta?.projectId || meta?.project_id || "";
-    if (pId) return pId;
+    if (pId) {
+      convIdProjectCache.set(convId, { projectId: pId, at: Date.now() });
+      return pId;
+    }
   } catch (e) {}
 
+  convIdProjectCache.set(convId, { projectId: "", at: Date.now() });
   return "";
 }
 

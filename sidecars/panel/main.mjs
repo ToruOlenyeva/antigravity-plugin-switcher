@@ -29,6 +29,28 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT || 8088);
 
+// 维护内置 Sidecar 最新状态快照与 SSE 实时双输出客户端集合（确保内置界面与 8088 端口 0ms 共享同一份 JSON 输出）
+const sseClients = new Set();
+let latestDualOutputState = null;
+let lastBroadcastSignature = "";
+
+function broadcastStateToAllFrontends(stateData, force = false) {
+  if (!stateData || !stateData.activeProjectId) return;
+  latestDualOutputState = stateData;
+  const pluginSig = (stateData.plugins || []).map((p) => `${p.dir}:${p.enabled ? 1 : 0}`).join(",");
+  const sig = `${stateData.activeProjectId}|${stateData.activeConversationId || ""}|${pluginSig}`;
+  if (!force && sig === lastBroadcastSignature) return;
+  lastBroadcastSignature = sig;
+  const payload = `data: ${JSON.stringify(stateData)}\n\n`;
+  for (const clientRes of sseClients) {
+    try {
+      clientRes.write(payload);
+    } catch (e) {
+      sseClients.delete(clientRes);
+    }
+  }
+}
+
 process.on("uncaughtException", (err) => {
   console.error("[PluginSwitcher Sidecar] Uncaught exception:", err?.stack || err?.message || err);
 });
@@ -232,9 +254,30 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 3. 状态接口（支持通过 conversationId、projectId、workspaceUri、token、sidecarProjectId、cid、active/passive 毫秒级直达当前 project_id）
+  // 2.5 SSE 实时双输出流（将内置 Sidecar 算出的同一份 stateData 0ms 实时推送给 8088 与所有活跃面板）
+  if (req.method === "GET" && pathname === "/api/events") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      "Connection": "keep-alive"
+    });
+    res.write(": connected\n\n");
+    if (latestDualOutputState) {
+      try {
+        res.write(`data: ${JSON.stringify(latestDualOutputState)}\n\n`);
+      } catch (e) {}
+    }
+    sseClients.add(res);
+    req.on("close", () => {
+      sseClients.delete(res);
+    });
+    return;
+  }
+
+  // 3. 状态接口（内置 Sidecar 计算出的同一份状态直接缓存并通过 SSE 0ms 双输出给 8088）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
+      const startMs = Date.now();
       const isStandalone8088 = Boolean(
         req.socket?.localPort === 8088 ||
         (req.headers.host || "").endsWith(":8088") ||
@@ -250,10 +293,28 @@ async function requestHandler(req, res) {
       const hasPassiveFlag = isStandalone8088 ? true : (url.searchParams.get("passive") === "1");
       const isPassive = hasActiveFlag ? false : hasPassiveFlag;
       const isInit = !isStandalone8088 && url.searchParams.get("init") === "1";
-      const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag, isInit });
+
+      let stateData;
+      if (isStandalone8088 && !clientProjectId && latestDualOutputState) {
+        // 8088 独立端口：直接复用内置 Sidecar 最新输出的同一份 activeProjectId 与会话上下文
+        stateData = getSystemState({
+          clientProjectId: latestDualOutputState.activeProjectId,
+          convId: latestDualOutputState.activeConversationId || "",
+          cid: "browser_8088",
+          isPassive: true
+        });
+      } else {
+        stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag, isInit });
+        if (!isStandalone8088) {
+          broadcastStateToAllFrontends(stateData);
+        }
+      }
+
+      const elapsedMs = Date.now() - startMs;
       if (!globalThis.__switcherDebugTrace) globalThis.__switcherDebugTrace = [];
       globalThis.__switcherDebugTrace.push({
         at: new Date().toISOString(),
+        elapsedMs,
         cid,
         token: token ? token.slice(0, 8) : "",
         convId: convId ? convId.slice(0, 8) : "",

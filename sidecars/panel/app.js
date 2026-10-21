@@ -1025,23 +1025,68 @@
     }
 
     let isSyncing = false;
+    function applyIncomingStateData(latestState) {
+      if (!latestState || typeof latestState !== "object") return;
+      if (latestState.bootId) {
+        if (window.__bootId && window.__bootId !== latestState.bootId) {
+          window.__bootId = latestState.bootId;
+          window.location.reload();
+          return;
+        }
+        window.__bootId = latestState.bootId;
+      }
+
+      state.projects = latestState.projects || state.projects;
+      state.profiles = latestState.profiles || state.profiles;
+      state.plugins = latestState.plugins || state.plugins;
+      state.activeProjectId = latestState.activeProjectId || state.activeProjectId;
+
+      const nextHostActiveId = latestState.activeProjectId;
+      // 核心门禁：当宿主真实发生跨项目切换（hostActiveId 物理跃变）时，立即同步聚焦与热加载
+      if (nextHostActiveId && nextHostActiveId !== lastHostActiveId) {
+        lastHostActiveId = nextHostActiveId;
+        populateProjectDropdown();
+        const select = document.getElementById("projectSelect");
+        if (select && select.querySelector(`option[value="${nextHostActiveId}"]`)) {
+          select.value = nextHostActiveId;
+          currentSelectedId = nextHostActiveId;
+          onSelectProject();
+          showToast(I18N[currentLang].toastAutoApplied);
+        }
+      } else if (!isBatchMode) {
+        // 核心双向感知：当宿主未切换项目，但在另一端面板或原生设置中拨动了开关时，实时同步更新当前选中项目开关
+        let hasDiff = false;
+        if (currentSelectedId === latestState.activeProjectId) {
+          for (const p of (latestState.plugins || [])) {
+            if (localEditedPlugins[p.dir] !== p.enabled) {
+              hasDiff = true;
+              localEditedPlugins[p.dir] = p.enabled;
+            }
+          }
+        } else if (latestState.profiles && latestState.profiles[currentSelectedId] && latestState.profiles[currentSelectedId].plugins) {
+          const profPlugins = latestState.profiles[currentSelectedId].plugins;
+          for (const p of (latestState.plugins || [])) {
+            const targetVal = p.protected ? true : (profPlugins[p.dir] !== undefined ? Boolean(profPlugins[p.dir]) : p.enabled);
+            if (localEditedPlugins[p.dir] !== targetVal) {
+              hasDiff = true;
+              localEditedPlugins[p.dir] = targetVal;
+            }
+          }
+        }
+        if (hasDiff) {
+          updateResetBtnVisibility();
+          updateStatusNote();
+          renderPluginCards();
+        }
+      }
+    }
+
     async function syncActiveProjectSilently(explicitProjectId = "", explicitWorkspaceUri = "", isPassive = false) {
       const hasExplicitPush = Boolean(explicitProjectId || explicitWorkspaceUri);
       if (!hasExplicitPush && !isPanelActuallyVisible()) return;
       if (isSyncing && isPassive) return;
       isSyncing = true;
       try {
-        if (isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
-          try {
-            const uris = await Promise.race([
-              window.sidecar.getWorkspaceUris(),
-              new Promise(resolve => setTimeout(() => resolve(null), 200))
-            ]);
-            if (Array.isArray(uris)) {
-              currentActiveWorkspaceUris = uris.filter(Boolean);
-            }
-          } catch (e) {}
-        }
         const urlParams = new URLSearchParams(window.location.search);
         const convId = isEmbeddedSidecar
           ? ((window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || lockedSidecarConvId || "")
@@ -1049,6 +1094,12 @@
         const token = isEmbeddedSidecar
           ? (urlParams.get("token") || (window.sidecar && window.sidecar.token) || "")
           : "";
+        // 非阻塞后台刷新工作区路径：绝不在发请求前 await 阻塞 200ms，彻底消除无本地文件夹项目（聊天/微信/relay）的切换停顿
+        if (!convId && isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
+          window.sidecar.getWorkspaceUris().then((uris) => {
+            if (Array.isArray(uris)) currentActiveWorkspaceUris = uris.filter(Boolean);
+          }).catch(() => {});
+        }
         const pId = typeof explicitProjectId === "string" ? explicitProjectId : "";
         const wsUri = isEmbeddedSidecar
           ? (typeof explicitWorkspaceUri === "string" && explicitWorkspaceUri ? explicitWorkspaceUri : currentActiveWorkspaceUris.join("|"))
@@ -1071,70 +1122,7 @@
         const res = await fetch(statusUrl);
         if (!res.ok) return;
         const latestState = await res.json();
-
-        if (latestState.bootId) {
-          if (window.__bootId && window.__bootId !== latestState.bootId) {
-            window.__bootId = latestState.bootId;
-            window.location.reload();
-            return;
-          }
-          window.__bootId = latestState.bootId;
-        }
-
-        state.projects = latestState.projects || state.projects;
-        state.profiles = latestState.profiles || state.profiles;
-        state.plugins = latestState.plugins || state.plugins;
-        state.activeProjectId = latestState.activeProjectId || state.activeProjectId;
-
-        if (
-          isEmbeddedSidecar &&
-          isPassive &&
-          lastHostActiveId &&
-          latestState.profiles?.__meta__?.lastSidecarProjectId &&
-          latestState.profiles.__meta__.lastSidecarProjectId !== lastHostActiveId &&
-          (document.hasFocus() || document.body?.matches?.(":hover") || document.documentElement?.matches?.(":hover"))
-        ) {
-          setTimeout(() => syncActiveProjectSilently(lastHostActiveId, "", false), 20);
-        }
-
-        const nextHostActiveId = latestState.activeProjectId;
-        // 核心门禁：仅当宿主真实发生跨项目切换（hostActiveId 物理跃变）时，才触发自动聚焦与自动热加载！
-        if (nextHostActiveId && nextHostActiveId !== lastHostActiveId) {
-          lastHostActiveId = nextHostActiveId;
-          populateProjectDropdown();
-          const select = document.getElementById("projectSelect");
-          if (select && select.querySelector(`option[value="${nextHostActiveId}"]`)) {
-            select.value = nextHostActiveId;
-            currentSelectedId = nextHostActiveId;
-            onSelectProject();
-            showToast(I18N[currentLang].toastAutoApplied);
-          }
-        } else if (!isBatchMode) {
-          // 核心双向感知：当宿主未切换项目，但在另一端面板或原生设置中拨动了开关时，实时同步更新当前选中项目开关！
-          let hasDiff = false;
-          if (currentSelectedId === latestState.activeProjectId) {
-            for (const p of (latestState.plugins || [])) {
-              if (localEditedPlugins[p.dir] !== p.enabled) {
-                hasDiff = true;
-                localEditedPlugins[p.dir] = p.enabled;
-              }
-            }
-          } else if (latestState.profiles && latestState.profiles[currentSelectedId] && latestState.profiles[currentSelectedId].plugins) {
-            const profPlugins = latestState.profiles[currentSelectedId].plugins;
-            for (const p of (latestState.plugins || [])) {
-              const targetVal = p.protected ? true : (profPlugins[p.dir] !== undefined ? Boolean(profPlugins[p.dir]) : p.enabled);
-              if (localEditedPlugins[p.dir] !== targetVal) {
-                hasDiff = true;
-                localEditedPlugins[p.dir] = targetVal;
-              }
-            }
-          }
-          if (hasDiff) {
-            updateResetBtnVisibility();
-            updateStatusNote();
-            renderPluginCards();
-          }
-        }
+        applyIncomingStateData(latestState);
       } catch (e) {
       } finally {
         isSyncing = false;
@@ -1167,19 +1155,6 @@
     async function initApp(isManualRefresh = false) {
       applyI18n();
       try {
-        if (isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
-          try {
-            const uris = await Promise.race([
-              window.sidecar.getWorkspaceUris(),
-              new Promise(resolve => setTimeout(() => resolve(null), 300))
-            ]);
-            if (Array.isArray(uris)) {
-              currentActiveWorkspaceUris = uris.filter(Boolean);
-            }
-          } catch (e) {}
-        }
-        try { sessionStorage.removeItem("ps_cached_ws_uris"); } catch (e) {}
-
         const urlParams = new URLSearchParams(window.location.search);
         const explicitConvId = isEmbeddedSidecar
           ? ((window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "")
@@ -1188,6 +1163,21 @@
           lockedSidecarConvId = explicitConvId;
         }
         const convId = lockedSidecarConvId || explicitConvId;
+        // 仅在无 convId（如未绑定会话的纯目录窗口）时进行 40ms 极速探测，有 convId 时 0ms 直接发请求，彻底根除 300ms 停顿
+        if (isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
+          const wsPromise = window.sidecar.getWorkspaceUris().then((uris) => {
+            if (Array.isArray(uris)) currentActiveWorkspaceUris = uris.filter(Boolean);
+            return uris;
+          }).catch(() => null);
+          if (!convId) {
+            await Promise.race([
+              wsPromise,
+              new Promise(resolve => setTimeout(() => resolve(null), 40))
+            ]);
+          }
+        }
+        try { sessionStorage.removeItem("ps_cached_ws_uris"); } catch (e) {}
+
         const token = isEmbeddedSidecar
           ? (urlParams.get("token") || (window.sidecar && window.sidecar.token) || "")
           : "";
@@ -1231,6 +1221,24 @@
 
         // 即时渲染卡片
         onSelectProject();
+
+        // 挂载 SSE 实时双输出监听（后端给内置 Sidecar 输出状态的同时，0ms 同步推送到 8088 独立页面）
+        if (!window.__sseSource && typeof window.EventSource === "function") {
+          try {
+            const es = new EventSource("/api/events");
+            es.onmessage = (ev) => {
+              if (!isPanelActuallyVisible()) return;
+              try {
+                const pushedState = JSON.parse(ev.data);
+                // 8088 独立页面或未锁死特定会话的面板直接 0ms 应用后端双输出状态
+                if (!isEmbeddedSidecar || !lockedSidecarConvId || pushedState.activeConversationId === lockedSidecarConvId) {
+                  applyIncomingStateData(pushedState);
+                }
+              } catch (e) {}
+            };
+            window.__sseSource = es;
+          } catch (e) {}
+        }
 
         // 挂载事件监听器与轻量安全心跳（跃变门禁守门：真切项目瞬间联动，编辑其他项目绝对不打断）
         if (!window.__listenersBound) {

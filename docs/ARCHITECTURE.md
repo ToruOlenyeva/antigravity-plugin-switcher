@@ -69,16 +69,17 @@ plugin-switcher/
 
 为了在复杂的宿主环境（多工作区、纯聊天会话、GCP 远程桌面、快速切标签页）中准确定位当前项目，系统实现了严密的四级裁决算法：
 
-### 级别 1：显式参数与直达探测
+### 级别 1：显式参数与 O(1) 内存映射极速快路
 Sidecar 优先提取客户端请求中携带的显式参数：
-- 显式 <code>conversationId</code> 或 <code>projectId</code>。
+- 显式 <code>conversationId</code> 或 <code>projectId</code>（当前端已持有 <code>conversationId</code> 时，直接免除 <code>window.sidecar.getWorkspaceUris()</code> 的跨进程阻塞等待，避免无本地路径会话产生超时停顿）。
+- <b>O(1) 内存映射查表优先（<code>convProjectMap</code> + <code>convIdProjectCache</code>）</b>：携带 <code>conversationId</code> 时，后端优先从内存映射表 <code>profiles.__meta__.convProjectMap[convId]</code> 与进程级缓存 <code>convIdProjectCache</code> 中直接命中目标项目 ID（耗时 <code>&lt; 1ms</code>），确保远程或无本地文件夹项目（如 <code>antigravity-relay</code>、纯对话项目等）同样实现 <code>&lt; 15ms</code> 丝滑秒切。
 - 携带 <code>token</code> 时，扫描 <code>app_storage.json</code> 中 <code>aux-pane-v2-session</code> 对应的会话 Tab。
 - 若参数为有效的 36 位 UUID 且存在于已知项目列表中，直接完成裁决。
 
 ### 级别 2：SQLite 直查与多工作区路径打分
-若显式参数缺失：
-- <b>原生 SQLite 毫秒级直查</b>：利用 <code>node:sqlite</code> 直连 <code>conversation_summaries.db</code>，按最后活跃时间检索当前会话的项目映射。
-- <b>最长公共路径打分协同</b>：当客户端上报 <code>workspaceUris</code> 时，遍历所有已知项目的物理路径。
+若级别 1 内存映射未命中：
+- <b>原生 SQLite 毫秒级直查（零子进程阻塞）</b>：利用 <code>node:sqlite</code> 常驻句柄直连 <code>conversation_summaries.db</code> 检索当前会话的项目绑定并写入 <code>convIdProjectCache</code>（当 <code>node:sqlite</code> 可用时彻底跳过外部子进程回退）。
+- <b>最长公共路径打分协同</b>：当新建对话（无 <code>conversationId</code>）且客户端上报 <code>workspaceUris</code> 时，遍历所有已知项目的物理路径。
   - 完全一致路径赋予最高权重（10000 分加路径字符长度）。
   - 前缀匹配子路径赋予前缀长度权重。
   - 得分最高者胜出，完美支持多目录工作区与单项目嵌套。
@@ -115,18 +116,19 @@ Sidecar 优先提取客户端请求中携带的显式参数：
   - 修改当前带绿点 <code>●</code> 的活跃项目 B（或默认配置 <code>__default__</code>）的开关时，立即写入 <code>config.json</code> 并通过 <code>ls-bridge.mjs</code> 派发 Language Server RPC 实时热重载指令（提示「已实时同步至当前活跃项目」）；
   - 后台 <code>2.5s</code> 静默心跳（<code>syncActiveProjectSilently</code>）<b>仅在宿主活跃项目发生真实物理跃变（<code>nextHostActiveId !== lastHostActiveId</code>）时</b>才自动将下拉框跟随切换至新活跃项目；宿主未切换项目时，绝不打断用户正在跨项目预览编辑的界面。
 
-### 3.3 内置 Sidecar 与外部浏览器 <code>http://localhost:8088</code> 实时双输出镜像及后台隐藏对话防抢占
+### 3.3 单进程双端口同源托管与 <code>http://localhost:8088</code> SSE 零延迟双输出镜像
+- <b>跨账户同源主目录反推与单进程双端口监听（<code>ls-bridge.mjs</code> + <code>main.mjs</code>）</b>：
+  - 针对 Windows 桌面登录标准账户而 Antigravity 宿主以管理员账户运行（或跨账户环境）导致的 <code>os.homedir()</code> 错位，后端通过 <code>resolveHostHomeDir()</code> 直接从插件自身所在的物理路径向上反推真实宿主用户目录，确保配置与状态库 100% 同源；
+  - 宿主拉起内置 Sidecar 时，同一 Node.js 进程同时监听宿主分配的动态端口（<code>ANTIGRAVITY_SIDECAR_WEB_PORT</code>）与独立 <code>8088</code> 端口（若 <code>8088</code> 被旧独立进程占用则自动通过 <code>POST /api/restart-sidecar</code> 驱逐接管），彻底消灭多进程脑裂。
+- <b>后端计算一次、<code>latestDualOutputState</code> + SSE（<code>GET /api/events</code>）零延迟双份输出</b>：
+  - 每当内置 Sidecar 请求 <code>GET /api/status</code> 计算出最新 <code>stateData</code> 时，后端立即将其缓存至内存 <code>latestDualOutputState</code>，并通过 <code>broadcastStateToAllFrontends(stateData)</code> 经由 <code>GET /api/events</code> (Server-Sent Events) <code>0ms</code> 实时推送给外部浏览器 <code>http://localhost:8088</code>；
+  - 外部浏览器 <code>http://localhost:8088</code> 通过 <code>new EventSource("/api/events")</code> 实时接收内置 Sidecar 的同一份状态数据包并立即更新 DOM，同时其常规 <code>GET /api/status</code> 请求直接复用 <code>latestDualOutputState.activeProjectId</code>（仅在内置 Sidecar 超过 <code>8s</code> 未轮询即面板关闭时，才回退使用 <code>app_storage.json</code> 置顶会话兜底），彻底杜绝独立猜状态导致的滞后与错位。
 - <b>前端双观察者可见性感知（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
-  - 在 Antigravity 宿主中切换已打开过的历史对话时，后台隐藏对话标签页的 Sidecar iframe 容器尺寸可能依然大于 10px 且 <code>document.hidden === false</code>。
-  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> 实时检测视口遮挡与真实可见性：当旧对话 Sidecar iframe 退入后台被遮挡或折叠时，立即冻结其 <code>2.5s</code> 定时轮询；当用户切回该对话使面板重新可见时，立即触发一次主动同步（<code>isPassive = false</code>）。
-- <b>后端跨进程磁盘镜像与后台标签页拦截（<code>isBackgroundTabPassive</code>）</b>：
-  - 前台可见的内置 Sidecar 每次同步时，后端 <code>scanner.mjs</code> 将解析结果实时持久化至磁盘 <code>project-plugin-profiles.json</code> 的 <code>__meta__.lastSidecarProjectId</code> 与 <code>__meta__.lastSidecarToken</code>；
-  - 若后台尚未销毁的非焦点对话 iframe 发出携带旧 <code>token</code> 的被动轮询（<code>passive=1</code>），后端通过比对 <code>lastSidecarToken</code> 与 <code>app_storage.json</code> 焦点会话将其识别为 <code>isBackgroundTabPassive = true</code>，严禁其篡改 <code>lastSidecarProjectId</code>、<code>lastActiveProjectId</code> 或 <code>config.json</code>；
-  - 外部浏览器访问 <code>http://localhost:8088</code>（无 <code>token</code> 参数）时，优先从磁盘读取最新的 <code>__meta__.lastSidecarProjectId</code> 进行 1:1 实时镜像展示，且其被动轮询仅做只读对齐，绝不覆写 <code>config.json</code>，确保外部浏览器打开期间后台运行中的项目 A 同样 100% 保持独立。
+  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> 实时检测视口遮挡与真实可见性：当旧对话 Sidecar iframe 退入后台被遮挡或折叠时，立即冻结其 <code>2.5s</code> 定时轮询；当用户切回该对话使面板重新可见时，立即触发一次主动同步（<code>isPassive = false</code>），瞬间驱动内置面板与 <code>8088</code> 同步翻转。
 
 ## 4. HTTP API 接口规范
 
-所有接口默认由本地 <code>http://127.0.0.1:8088</code> 提供。
+所有接口默认由本地内置动态端口与独立 <code>http://127.0.0.1:8088</code> 同源双端口提供。
 
 ### 4.1 获取运行状态与项目配置
 - <b>路径</b>：<code>GET /api/status</code>
@@ -154,6 +156,11 @@ Sidecar 优先提取客户端请求中携带的显式参数：
   "projects": []
 }
 ```
+
+### 4.1.1 实时状态双输出事件流（SSE）
+- <b>路径</b>：<code>GET /api/events</code>
+- <b>响应类型</b>：<code>text/event-stream; charset=utf-8</code>
+- <b>说明</b>：连接建立时立即推送当前最新的 <code>latestDualOutputState</code>，并在内置 Sidecar 每次完成状态计算后 <code>0ms</code> 广播同一份 <code>stateData</code> JSON 数据帧（<code>data: {...}\n\n</code>），供 <code>http://localhost:8088</code> 与多端面板零延迟同步。
 
 ### 4.2 切换单个插件状态
 - <b>路径</b>：<code>POST /api/set-plugin-state</code>
