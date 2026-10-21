@@ -276,14 +276,11 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
   // 计算两个核心信号
   let convProjId = "";
   if (convId) {
+    const dbId = resolveProjectIdFromDb(convId);
     const mappedId = convProjectMap[convId] || "";
-    if (!clientWorkspaceUri && mappedId && projects.some(p => p.id === mappedId)) {
-      convProjId = mappedId;
-    } else {
-      const pId = resolveProjectIdFromDb(convId) || mappedId;
-      if (pId && projects.some(p => p.id === pId)) {
-        convProjId = pId;
-      }
+    const pId = (dbId && projects.some(p => p.id === dbId)) ? dbId : mappedId;
+    if (pId && projects.some(p => p.id === pId)) {
+      convProjId = pId;
     }
   } else if (tokenMatchedNewConvoProjId && projects.some(p => p.id === tokenMatchedNewConvoProjId)) {
     convProjId = tokenMatchedNewConvoProjId;
@@ -335,69 +332,25 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     activeProjectId = convProjId;
   }
 
-  const storageConvId = getActiveConversationIdFromStorage();
-
-  // 优先级 4（外部浏览器 localhost:8088 等无显式上下文请求的精准同步链）
+  // 优先级 4（8088 外部浏览器无参数访问：直接复用输出给内置 Sidecar 的项目结果）
   if (!activeProjectId) {
-    // 4.1 若内置 IDE Sidecar 已上报实时上下文，且焦点会话未切换，直接共享 IDE Sidecar 裁决结果
-    if (
-      lastIdeContext.activeProjectId &&
-      projects.some(p => p.id === lastIdeContext.activeProjectId) &&
-      (!storageConvId || !lastIdeContext.effectiveConvId || storageConvId === lastIdeContext.effectiveConvId)
-    ) {
+    if (lastIdeContext.activeProjectId && projects.some(p => p.id === lastIdeContext.activeProjectId)) {
       activeProjectId = lastIdeContext.activeProjectId;
-    }
-
-    // 4.2 通过当前焦点会话（projectsConversationOrder[0]）结合 convProjectMap 与 SQLite 数据库反查
-    if (!activeProjectId && storageConvId) {
-      const mappedProjId = convProjectMap[storageConvId] || "";
-      if (mappedProjId && projects.some(p => p.id === mappedProjId)) {
-        activeProjectId = mappedProjId;
-      } else {
-        const dbProjId = resolveProjectIdFromDb(storageConvId);
-        if (dbProjId && projects.some(p => p.id === dbProjId)) {
-          const dbProj = projects.find(p => p.id === dbProjId);
-          // 若数据库中记录为无目录纯聊天，但 lastIdeContext 携带有效工作区，优先按实时工作区对齐
-          if (dbProj && dbProj.isPureChat && lastIdeContext.workspaceUri) {
-            const wsFromIde = findProjectIdByWorkspaceUris(lastIdeContext.workspaceUri, projects);
-            activeProjectId = wsFromIde || dbProjId;
-          } else {
-            activeProjectId = dbProjId;
-          }
-        }
-      }
-    }
-
-    // 4.3 读取 Hook 或面板最新持久化的 lastActiveProjectId
-    if (!activeProjectId && meta.lastActiveProjectId && projects.some(p => p.id === meta.lastActiveProjectId)) {
+    } else if (meta.lastSidecarProjectId && projects.some(p => p.id === meta.lastSidecarProjectId)) {
+      activeProjectId = meta.lastSidecarProjectId;
+    } else if (meta.lastActiveProjectId && projects.some(p => p.id === meta.lastActiveProjectId)) {
       activeProjectId = meta.lastActiveProjectId;
-    }
-
-    // 4.4 数据库最近一次用户输入会话兜底
-    if (!activeProjectId) {
-      const latestId = getLatestActiveProjectIdFromDb();
-      if (latestId && projects.some(p => p.id === latestId)) {
-        activeProjectId = latestId;
-      }
-    }
-
-    // 4.5 最低优先级兜底：仅当完全无历史活跃会话时才读取新对话草稿页缓存
-    if (!activeProjectId) {
-      const lastSelected = appStorage["new-convo-last-selected-project"];
-      if (lastSelected && projects.some(p => p.id === lastSelected)) {
-        activeProjectId = lastSelected;
-      }
     }
   }
 
-  const effectiveConvId = convId || storageConvId || lastIdeContext.effectiveConvId || "";
-  const activeWorkspace = (clientWorkspaceUri || lastIdeContext.workspaceUri || "").replace(/\\/g, "/");
+  const effectiveConvId = convId || lastIdeContext.effectiveConvId || meta.lastSidecarConvId || "";
+  const activeWorkspace = (clientWorkspaceUri || lastIdeContext.workspaceUri || meta.lastSidecarWorkspace || "").replace(/\\/g, "/");
 
   if (hasExplicitIdeContext && activeProjectId) {
     lastIdeContext = {
       activeProjectId,
       effectiveConvId,
-      workspaceUri: (clientWorkspaceUri || lastIdeContext.workspaceUri || "").replace(/\\/g, "/"),
+      workspaceUri: activeWorkspace,
       updatedAt: Date.now()
     };
   }
@@ -540,8 +493,20 @@ function getSystemState(query = {}) {
     profiles.__meta__
   );
 
-  // 同步记录会话与项目的映射表，确保外部浏览器无参数访问时也能 100% 命中真实项目
+  // 同步记录内置 Sidecar 的项目输出与会话映射，供 8088 外部浏览器 1:1 镜像复用
   const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
+  if (hasExplicitContext && activeProjectId && activeProjectId !== DEFAULT_KEY) {
+    if (
+      profiles.__meta__.lastSidecarProjectId !== activeProjectId ||
+      profiles.__meta__.lastSidecarConvId !== effectiveConvId ||
+      profiles.__meta__.lastSidecarWorkspace !== activeWorkspace
+    ) {
+      profiles.__meta__.lastSidecarProjectId = activeProjectId;
+      profiles.__meta__.lastSidecarConvId = effectiveConvId;
+      profiles.__meta__.lastSidecarWorkspace = activeWorkspace;
+      profilesModified = true;
+    }
+  }
   if (
     effectiveConvId &&
     activeProjectId &&
