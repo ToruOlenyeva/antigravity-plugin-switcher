@@ -1017,7 +1017,8 @@
 
     let isSyncing = false;
     async function syncActiveProjectSilently(explicitProjectId = "", explicitWorkspaceUri = "", isPassive = false) {
-      if (!isPanelActuallyVisible()) return;
+      const hasExplicitPush = Boolean(explicitProjectId || explicitWorkspaceUri);
+      if (!hasExplicitPush && !isPanelActuallyVisible()) return;
       if (isSyncing) return;
       isSyncing = true;
       try {

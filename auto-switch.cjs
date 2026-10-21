@@ -259,20 +259,23 @@ async function main() {
     }
 
     // 3. 收集工作区候选 URI（含 PreToolUse 工具参数路径反推，解决新会话与子智能体溯源）
-    const candidateUris = [];
-    if (Array.isArray(payload.workspaceUris)) candidateUris.push(...payload.workspaceUris);
-    else if (typeof payload.workspaceUris === "string") candidateUris.push(payload.workspaceUris);
+    const explicitWorkspaceUris = [];
+    if (Array.isArray(payload.workspaceUris)) explicitWorkspaceUris.push(...payload.workspaceUris);
+    else if (typeof payload.workspaceUris === "string") explicitWorkspaceUris.push(payload.workspaceUris);
 
     if (Array.isArray(payload.workspaceFolders)) {
       for (const f of payload.workspaceFolders) {
-        if (typeof f === "string") candidateUris.push(f);
-        else if (f && (f.uri || f.path)) candidateUris.push(f.uri || f.path);
+        if (typeof f === "string") explicitWorkspaceUris.push(f);
+        else if (f && (f.uri || f.path)) explicitWorkspaceUris.push(f.uri || f.path);
       }
     } else if (typeof payload.workspaceFolders === "string") {
-      candidateUris.push(payload.workspaceFolders);
+      explicitWorkspaceUris.push(payload.workspaceFolders);
     }
-    if (payload.workspaceUri) candidateUris.push(payload.workspaceUri);
-    if (payload.workspaceFolder) candidateUris.push(payload.workspaceFolder);
+    if (payload.workspaceUri) explicitWorkspaceUris.push(payload.workspaceUri);
+    if (payload.workspaceFolder) explicitWorkspaceUris.push(payload.workspaceFolder);
+
+    const hasExplicitWorkspace = explicitWorkspaceUris.filter(Boolean).length > 0;
+    const candidateUris = [...explicitWorkspaceUris];
     if (payload.cwd) candidateUris.push(payload.cwd);
 
     if (payload.toolCall && payload.toolCall.args && typeof payload.toolCall.args === "object") {
@@ -325,8 +328,8 @@ async function main() {
 
           if (isConvSubOfWs) {
             activeProjectId = convProjId;
-          } else if (!convProj || !convProj.paths || convProj.paths.length === 0) {
-            // 纯对话项目（聊天），无工作区路径，属于当前对话自身
+          } else if ((!convProj || !convProj.paths || convProj.paths.length === 0) && !hasExplicitWorkspace) {
+            // 纯对话项目（聊天），仅当宿主未挂载显式工作区目录时才归属纯对话项目
             activeProjectId = convProjId;
           } else {
             activeProjectId = wsProjId;
