@@ -249,7 +249,8 @@ async function requestHandler(req, res) {
       const hasActiveFlag = isStandalone8088 ? false : (url.searchParams.get("active") === "1");
       const hasPassiveFlag = isStandalone8088 ? true : (url.searchParams.get("passive") === "1");
       const isPassive = hasActiveFlag ? false : hasPassiveFlag;
-      const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag });
+      const isInit = !isStandalone8088 && url.searchParams.get("init") === "1";
+      const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag, isInit });
       if (!globalThis.__switcherDebugTrace) globalThis.__switcherDebugTrace = [];
       globalThis.__switcherDebugTrace.push({
         at: new Date().toISOString(),
@@ -260,6 +261,7 @@ async function requestHandler(req, res) {
         sidecarProjectId: sidecarProjectId ? sidecarProjectId.slice(0, 8) : "",
         isPassive,
         hasActiveFlag,
+        isInit,
         resolvedActiveProjectId: stateData.activeProjectId,
         resolvedConvId: stateData.activeConversationId
       });
@@ -808,6 +810,53 @@ if (PORT !== 8088) {
 
   tryBind8088();
 }
+
+const boundPorts = new Set([PORT, 8088]);
+
+function bindAdditionalSidecarPorts() {
+  try {
+    const candidatePorts = new Set();
+    const profiles = readJsonSafe(PROFILES_FILE, {});
+    if (profiles?.__meta__) {
+      const recent = Array.isArray(profiles.__meta__.recentSidecarPorts) ? profiles.__meta__.recentSidecarPorts : [];
+      if (PORT !== 8088 && !recent.includes(PORT)) {
+        recent.unshift(PORT);
+        profiles.__meta__.recentSidecarPorts = recent.slice(0, 12);
+        writeJsonSafe(PROFILES_FILE, profiles);
+      }
+      for (const p of (profiles.__meta__.recentSidecarPorts || [])) {
+        const num = Number(p);
+        if (num > 1024 && num < 65535) candidatePorts.add(num);
+      }
+    }
+    const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
+    const rawText = JSON.stringify(appStorage || {});
+    const regex = /plugin-switcher--panel-(\d+)/g;
+    let match;
+    while ((match = regex.exec(rawText)) !== null) {
+      const num = Number(match[1]);
+      if (num > 1024 && num < 65535) candidatePorts.add(num);
+    }
+    for (const p of candidatePorts) {
+      if (boundPorts.has(p)) continue;
+      boundPorts.add(p);
+      try {
+        const legacyServer = http.createServer(requestHandler);
+        legacyServer.on("error", () => {
+          boundPorts.delete(p);
+        });
+        legacyServer.listen(p, "127.0.0.1", () => {
+          console.log(`[PluginSwitcher Sidecar] Legacy session port bridged on http://127.0.0.1:${p}`);
+        });
+      } catch (e) {
+        boundPorts.delete(p);
+      }
+    }
+  } catch (e) {}
+}
+
+bindAdditionalSidecarPorts();
+setInterval(bindAdditionalSidecarPorts, 5000);
 
 // 后台监听 config.json 物理变更：仅当 config.json 相比本插件最后一次下发的快照（lastAppliedConfigSnapshot）发生真实偏离时，才认定为用户在原生 Settings 中手动拨动了开关
 try {

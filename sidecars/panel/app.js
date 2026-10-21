@@ -23,8 +23,8 @@
     );
 
     function isPanelActuallyVisible() {
-      if (document.hidden) return false;
       if (!isEmbeddedSidecar) return true;
+      if (document.hidden) return false;
       if (!isViewportIntersecting) return false;
       if (window.innerWidth <= 10 || window.innerHeight <= 10) return false;
       if (!document.body || document.body.offsetWidth <= 10 || document.body.offsetHeight <= 10) return false;
@@ -1031,9 +1031,20 @@
       if (isSyncing && isPassive) return;
       isSyncing = true;
       try {
+        if (isEmbeddedSidecar && window.sidecar && typeof window.sidecar.getWorkspaceUris === "function") {
+          try {
+            const uris = await Promise.race([
+              window.sidecar.getWorkspaceUris(),
+              new Promise(resolve => setTimeout(() => resolve(null), 200))
+            ]);
+            if (Array.isArray(uris)) {
+              currentActiveWorkspaceUris = uris.filter(Boolean);
+            }
+          } catch (e) {}
+        }
         const urlParams = new URLSearchParams(window.location.search);
         const convId = isEmbeddedSidecar
-          ? (lockedSidecarConvId || (window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || "")
+          ? ((window.sidecar && window.sidecar.conversationId) || urlParams.get("conversationId") || lockedSidecarConvId || "")
           : "";
         const token = isEmbeddedSidecar
           ? (urlParams.get("token") || (window.sidecar && window.sidecar.token) || "")
@@ -1050,9 +1061,6 @@
         if (wsUri) queryParts.push(`workspaceUri=${encodeURIComponent(wsUri)}`);
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
         if (isEmbeddedSidecar) queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
-        if (isEmbeddedSidecar && lastHostActiveId && !pId) {
-          queryParts.push(`sidecarProjectId=${encodeURIComponent(lastHostActiveId)}`);
-        }
         if (!isEmbeddedSidecar || isPassive) {
           queryParts.push("passive=1");
         } else {
@@ -1165,17 +1173,12 @@
               window.sidecar.getWorkspaceUris(),
               new Promise(resolve => setTimeout(() => resolve(null), 300))
             ]);
-            if (Array.isArray(uris) && uris.length > 0) {
+            if (Array.isArray(uris)) {
               currentActiveWorkspaceUris = uris.filter(Boolean);
-              try { sessionStorage.setItem("ps_cached_ws_uris", JSON.stringify(currentActiveWorkspaceUris)); } catch (e) {}
-            } else {
-              try {
-                const cached = JSON.parse(sessionStorage.getItem("ps_cached_ws_uris") || "[]");
-                if (Array.isArray(cached) && cached.length > 0) currentActiveWorkspaceUris = cached;
-              } catch (e) {}
             }
           } catch (e) {}
         }
+        try { sessionStorage.removeItem("ps_cached_ws_uris"); } catch (e) {}
 
         const urlParams = new URLSearchParams(window.location.search);
         const explicitConvId = isEmbeddedSidecar
@@ -1195,7 +1198,10 @@
           queryParts.push(`workspaceUri=${encodeURIComponent(currentActiveWorkspaceUris.join("|"))}`);
         }
         if (token) queryParts.push(`token=${encodeURIComponent(token)}`);
-        if (isEmbeddedSidecar) queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
+        if (isEmbeddedSidecar) {
+          queryParts.push(`cid=${encodeURIComponent(clientInstanceId)}`);
+          queryParts.push("init=1");
+        }
         if (isEmbeddedSidecar && isPanelActuallyVisible()) {
           queryParts.push("active=1");
         } else {

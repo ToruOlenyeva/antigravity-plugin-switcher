@@ -246,10 +246,14 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     sidecarProjectId = params.sidecarProjectId || "";
   }
 
-  const hasExplicitIdeContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
+  const hasExplicitIdeContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
   const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
   const meta = profilesMeta || (readJsonSafe(PROFILES_FILE, {}).__meta__) || {};
   const convProjectMap = (meta && typeof meta.convProjectMap === "object") ? meta.convProjectMap : {};
+  const rawNewConvoProjId = typeof appStorage["new-convo-last-selected-project"] === "string"
+    ? appStorage["new-convo-last-selected-project"].trim().replace(/^"|"$/g, "")
+    : "";
+  const newConvoSelectedProjId = (rawNewConvoProjId && projects.some(p => p.id === rawNewConvoProjId)) ? rawNewConvoProjId : "";
 
   // 优先级 1：严格校验 clientProjectId：必须是合法的 36 位 UUID 且在 projects 中存在才采信
   if (clientProjectId && /^[0-9a-f-]{36}$/i.test(clientProjectId) && projects && projects.length) {
@@ -288,7 +292,8 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
       convProjId = pId;
     }
   } else if (tokenMatchedNewConvoProjId && projects.some(p => p.id === tokenMatchedNewConvoProjId)) {
-    convProjId = tokenMatchedNewConvoProjId;
+    // 若当前处于新对话面板（无 convId），且 app_storage.json 的 new-convo-last-selected-project 已指向新项目，则以宿主最新选中的新对话项目为准
+    convProjId = (newConvoSelectedProjId && meta.lastSidecarIsNewConvo) ? newConvoSelectedProjId : tokenMatchedNewConvoProjId;
   }
 
   let wsProjId = "";
@@ -324,7 +329,7 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
       if (isConvSubOfWs) {
         // 历史对话挂在父级工作区目录下，但对话本身属于子目录项目
         activeProjectId = convProjId;
-      } else if (convProj && convProj.isPureChat && !clientWorkspaceUri) {
+      } else if (convProj && convProj.isPureChat) {
         activeProjectId = convProjId;
       } else {
         // 其他跨项目切换场景，优先返回实时推送的 wsProjId
@@ -335,8 +340,9 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     activeProjectId = wsProjId;
   } else if (convProjId) {
     activeProjectId = convProjId;
-  } else if (sidecarProjectId && projects.some(p => p.id === sidecarProjectId)) {
-    activeProjectId = sidecarProjectId;
+  } else if (hasExplicitIdeContext && !convId && newConvoSelectedProjId) {
+    // 纯聊天项目（无本地目录 paths=[]）或新对话面板首次初始化时，直接采用 app_storage.json 当前选中的项目
+    activeProjectId = newConvoSelectedProjId;
   }
 
   // 优先级 4（8088 外部浏览器无参数访问：结合 app_storage 活跃对话头与内置 Sidecar 最新落盘结果，跨进程 100% 同步）
@@ -375,6 +381,7 @@ function getSystemState(query = {}) {
   let cid = "";
   let isPassive = false;
   let hasActiveFlag = false;
+  let isInit = false;
 
   if (typeof query === "string") {
     convId = query;
@@ -387,6 +394,7 @@ function getSystemState(query = {}) {
     cid = query.cid || "";
     isPassive = query.isPassive === true;
     hasActiveFlag = query.hasActiveFlag === true;
+    isInit = query.isInit === true;
   }
   const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
   const rawProfiles = readJsonSafe(PROFILES_FILE, {});
@@ -534,6 +542,23 @@ function getSystemState(query = {}) {
     profiles.__meta__.lastSidecarConvId = storageHeadConvId;
     profiles.__meta__.lastSidecarWorkspace = (headProj && headProj.primaryPath) || "";
     profiles.__meta__.lastSidecarIsNewConvo = false;
+    profiles.__meta__.lastSidecarSwitchAt = now;
+    profilesModified = true;
+  }
+
+  // 当用户在 Antigravity IDE 侧边栏点击切换项目（触发 app_storage.json 的 new-convo-last-selected-project 跃变）时，立即同步基准项目
+  const rawNewConvoProjId = typeof appStorage["new-convo-last-selected-project"] === "string"
+    ? appStorage["new-convo-last-selected-project"].trim().replace(/^"|"$/g, "")
+    : "";
+  const newConvoSelectedProjId = (rawNewConvoProjId && projects.some(p => p.id === rawNewConvoProjId)) ? rawNewConvoProjId : "";
+  if (newConvoSelectedProjId && profiles.__meta__.lastNewConvoSelectedProjId !== newConvoSelectedProjId) {
+    const selProj = projects.find(p => p.id === newConvoSelectedProjId);
+    profiles.__meta__.lastNewConvoSelectedProjId = newConvoSelectedProjId;
+    profiles.__meta__.lastSidecarProjectId = newConvoSelectedProjId;
+    profiles.__meta__.lastSidecarConvId = "";
+    profiles.__meta__.lastSidecarWorkspace = (selProj && selProj.primaryPath) || "";
+    profiles.__meta__.lastSidecarIsNewConvo = true;
+    profiles.__meta__.lastSidecarSwitchAt = now;
     profilesModified = true;
   }
 
@@ -544,8 +569,19 @@ function getSystemState(query = {}) {
   );
 
   // 识别是否为后台隐藏对话标签页发出的被动轮询，同时通过帧率节流追踪识别当前真正处于前台可见状态的内置 Sidecar
-  const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token || sidecarProjectId);
+  const hasExplicitContext = Boolean(convId || clientProjectId || clientWorkspaceUri || token);
+  const resolvedTokenInfo = (!convId && token) ? resolveConvIdFromToken(token, appStorage) : { convId: "", newConvoProjId: "" };
+  const isStaleNewConvoTab = Boolean(
+    !convId &&
+    !resolvedTokenInfo.convId &&
+    resolvedTokenInfo.newConvoProjId &&
+    newConvoSelectedProjId &&
+    resolvedTokenInfo.newConvoProjId !== newConvoSelectedProjId &&
+    profiles.__meta__.lastSidecarIsNewConvo
+  );
   const instanceKey = cid || token || effectiveConvId || activeWorkspace || activeProjectId || "";
+  const isFirstSeenInstance = Boolean(hasExplicitContext && instanceKey && !instancePollTracker.has(instanceKey));
+  const isPostBootQuiet = (now - Number(SIDECAR_BOOT_ID)) > 3500;
   const lastActiveKey = profiles.__meta__.lastSidecarInstanceKey || profiles.__meta__.lastSidecarToken || profiles.__meta__.lastSidecarConvId || profiles.__meta__.lastSidecarWorkspace || profiles.__meta__.lastSidecarProjectId || "";
   const lastActiveTrackBefore = (lastActiveKey && lastActiveKey !== instanceKey) ? instancePollTracker.get(lastActiveKey) : null;
   const prevInstanceSilentMs = lastActiveTrackBefore ? (now - lastActiveTrackBefore.lastAt) : Infinity;
@@ -564,23 +600,21 @@ function getSystemState(query = {}) {
       fastTicks = prevTrack.fastTicks;
     }
     instancePollTracker.set(instanceKey, { lastAt: now, fastTicks });
-
-    if (!hasActiveFlag && !isPassive && sidecarProjectId && deltaMs > 3800) {
-      isPassive = true;
-    }
   }
 
-  let isBackgroundTabPassive = false;
-  if (isPassive && hasExplicitContext) {
+  let isBackgroundTabPassive = isStaleNewConvoTab;
+  if (!isBackgroundTabPassive && isPassive && hasExplicitContext) {
     const lastProj = profiles.__meta__.lastSidecarProjectId || "";
     const isDifferentInstance = Boolean(
       (lastActiveKey && instanceKey && instanceKey !== lastActiveKey) ||
       (lastProj && activeProjectId && activeProjectId !== lastProj)
     );
     if (isDifferentInstance) {
-      const sinceLastActiveMs = now - Number(profiles.__meta__.lastSidecarActiveAt || 0);
-      // 当前实例正在前台以 2.5s 正常帧率连续心跳（未被 Chromium 后台隐藏标签页节流），而上一实例已静默 > 3200ms 时，立即允许接管前台项目
-      if (fastTicks >= 1 && prevInstanceSilentMs > 3200 && sinceLastActiveMs > 2000) {
+      const sinceLastSwitchMs = now - Number(profiles.__meta__.lastSidecarSwitchAt || 0);
+      // 若刚通过侧边栏 new-convo-last-selected-project 切换到其他项目（3.5s 内），阻止旧标签页的尾随被动心跳回滚项目
+      if (profiles.__meta__.lastSidecarIsNewConvo && sinceLastSwitchMs < 3500 && activeProjectId !== profiles.__meta__.lastSidecarProjectId) {
+        isBackgroundTabPassive = true;
+      } else if (((isInit || isFirstSeenInstance) && isPostBootQuiet) || prevInstanceSilentMs > 2600 || fastTicks >= 1) {
         isBackgroundTabPassive = false;
       } else {
         isBackgroundTabPassive = true;
