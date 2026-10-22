@@ -306,21 +306,23 @@ async function main() {
 
     let convProjId = "";
     if (payloadConvId) {
-      const cachedProjId = profiles.__meta__.convProjectMap[payloadConvId] || "";
-      if (cachedProjId && (profiles[cachedProjId] || seenProjIds.has(cachedProjId))) {
-        convProjId = cachedProjId;
+      // 1. 优先查 SQLite conversation_summaries.db 唯一事实源（<0.5ms），防止旧缓存或跨目录读文件污染项目归属
+      const dbProjId = resolveProjectIdByConvId(payloadConvId, CONV_DB_PATH);
+      if (dbProjId && (profiles[dbProjId] || seenProjIds.has(dbProjId))) {
+        convProjId = dbProjId;
       } else {
-        convProjId = resolveProjectIdByConvId(payloadConvId, CONV_DB_PATH);
-        if (convProjId && !profiles[convProjId] && !seenProjIds.has(convProjId)) {
-          convProjId = "";
+        const cachedProjId = profiles.__meta__.convProjectMap[payloadConvId] || "";
+        if (cachedProjId && (profiles[cachedProjId] || seenProjIds.has(cachedProjId))) {
+          convProjId = cachedProjId;
         }
       }
     }
 
-    // 3. 收集工作区候选 URI（含 PreToolUse 工具参数路径反推，解决新会话与子智能体溯源）
+    // 3. 收集工作区候选 URI（优先显式 workspaceUris，且排除跨项目读取 .gemini/config/plugins 技能文件时的误匹配）
     const explicitWorkspaceUris = [];
     if (Array.isArray(payload.workspaceUris)) explicitWorkspaceUris.push(...payload.workspaceUris);
     else if (typeof payload.workspaceUris === "string") explicitWorkspaceUris.push(payload.workspaceUris);
+    if (Array.isArray(payload.workspace_uris)) explicitWorkspaceUris.push(...payload.workspace_uris);
 
     if (Array.isArray(payload.workspaceFolders)) {
       for (const f of payload.workspaceFolders) {
@@ -333,72 +335,39 @@ async function main() {
     if (payload.workspaceUri) explicitWorkspaceUris.push(payload.workspaceUri);
     if (payload.workspaceFolder) explicitWorkspaceUris.push(payload.workspaceFolder);
 
-    const hasExplicitWorkspace = explicitWorkspaceUris.filter(Boolean).length > 0;
-    const candidateUris = [...explicitWorkspaceUris];
-    if (payload.cwd) candidateUris.push(payload.cwd);
-
-    if (payload.toolCall && payload.toolCall.args && typeof payload.toolCall.args === "object") {
+    let wsProjId = "";
+    if (explicitWorkspaceUris.filter(Boolean).length > 0) {
+      wsProjId = findProjectIdByWorkspaceUris(explicitWorkspaceUris, projList);
+    }
+    if (!wsProjId && payload.cwd) {
+      wsProjId = findProjectIdByWorkspaceUris([payload.cwd], projList);
+    }
+    if (!wsProjId && payload.toolCall && payload.toolCall.args && typeof payload.toolCall.args === "object") {
       const tArgs = payload.toolCall.args;
       const toolPaths = [tArgs.Cwd, tArgs.AbsolutePath, tArgs.TargetFile, tArgs.Path, tArgs.path, tArgs.file_path, tArgs.SearchPath, tArgs.DirectoryPath];
+      const filteredToolPaths = [];
       for (const tp of toolPaths) {
         if (typeof tp === "string" && tp.trim()) {
           const normTp = tp.replace(/\\/g, "/").toLowerCase();
-          if (!normTp.includes(".gemini/antigravity/brain")) {
-            candidateUris.push(tp);
+          if (!normTp.includes(".gemini/antigravity/brain") && !normTp.includes(".gemini/config/plugins")) {
+            filteredToolPaths.push(tp);
           }
         }
       }
+      if (filteredToolPaths.length > 0) {
+        wsProjId = findProjectIdByWorkspaceUris(filteredToolPaths, projList);
+      }
     }
 
-    let wsProjId = "";
-    if (candidateUris.length > 0) {
-      wsProjId = findProjectIdByWorkspaceUris(candidateUris, projList);
-    }
-
-    // 4. 智能协同裁决（优先级与 main.mjs 100% 保持一致）
+    // 4. 智能协同裁决：一旦 SQLite / convProjectMap 明确认定了当前会话所属的 convProjId（含「聊天」项目），绝不允许被窗口残留 cwd 或工具读文件路径覆盖！
     let activeProjectId = "";
     const explicitId = payload.projectId || payload.project_id || "";
     if (explicitId && /^[0-9a-f-]{36}$/i.test(explicitId) && (profiles[explicitId] || seenProjIds.has(explicitId))) {
       activeProjectId = explicitId;
-    }
-
-    if (!activeProjectId) {
-      if (convProjId && wsProjId) {
-        if (convProjId === wsProjId) {
-          activeProjectId = convProjId;
-        } else {
-          const convProj = projList.find(p => p.id === convProjId) || profiles[convProjId];
-          const wsProj = projList.find(p => p.id === wsProjId) || profiles[wsProjId];
-
-          let isConvSubOfWs = false;
-          if (convProj && wsProj) {
-            for (const cp of (convProj.paths || [])) {
-              const normCp = normalizePath(cp);
-              for (const wp of (wsProj.paths || [])) {
-                const normWp = normalizePath(wp);
-                if (normCp && normWp && normCp.startsWith(normWp + "/")) {
-                  isConvSubOfWs = true;
-                  break;
-                }
-              }
-              if (isConvSubOfWs) break;
-            }
-          }
-
-          if (isConvSubOfWs) {
-            activeProjectId = convProjId;
-          } else if ((!convProj || !convProj.paths || convProj.paths.length === 0) && !hasExplicitWorkspace) {
-            // 纯对话项目（聊天），仅当宿主未挂载显式工作区目录时才归属纯对话项目
-            activeProjectId = convProjId;
-          } else {
-            activeProjectId = wsProjId;
-          }
-        }
-      } else if (convProjId) {
-        activeProjectId = convProjId;
-      } else if (wsProjId) {
-        activeProjectId = wsProjId;
-      }
+    } else if (convProjId) {
+      activeProjectId = convProjId;
+    } else if (wsProjId) {
+      activeProjectId = wsProjId;
     }
 
     // 5. 兜底：仅在非 pre-tool 模式下才允许读取 app_storage.json 的 projectsConversationOrder[0]
@@ -452,7 +421,7 @@ async function main() {
     // 检测当前触发 Hook 的会话是否为「后台运行对话」（前台已切换到其他项目）
     let storageHeadConvId = "";
     try {
-      const storage = readJsonSafe(appStoragePath, null);
+      const storage = readJsonRobust(APP_STORAGE_FILE, null);
       if (storage && storage.projectsConversationOrder) {
         const order = typeof storage.projectsConversationOrder === "string"
           ? JSON.parse(storage.projectsConversationOrder)

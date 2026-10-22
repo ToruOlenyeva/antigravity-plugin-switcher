@@ -246,11 +246,15 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
 
   const meta = profilesMeta || (readJsonSafe(PROFILES_FILE, {}).__meta__) || {};
 
-  // 第一权威源：Antigravity Electron 主窗口实时路由 (/c/<convId>?section=<projectId>)
-  // 无论内置 Sidecar 是否打开、是否存在 5 个并发后台 iframe 轮询，主窗口 page 路由永远 100% 反映用户当前真实焦点！
+  // 第一权威源：Antigravity Electron 主窗口实时路由 (/c/<convId>?section=<projectId> 或 /c/<convId>)
+  // 无论内置 Sidecar 是否打开、是否存在多个并发后台 iframe 轮询，主窗口 page 路由永远 100% 反映用户当前真实焦点！
   const windowRoute = getFocusedWindowRoute();
-  if (windowRoute && windowRoute.projectId && (Date.now() - windowRoute.updatedAt < 10000)) {
-    const matchedProj = projects.find((p) => p.id === windowRoute.projectId);
+  if (windowRoute && (windowRoute.projectId || windowRoute.convId) && (Date.now() - windowRoute.updatedAt < 10000)) {
+    const resolvedRouteProjId =
+      windowRoute.projectId ||
+      (windowRoute.convId && meta.convProjectMap && meta.convProjectMap[windowRoute.convId]) ||
+      (windowRoute.convId ? resolveProjectIdFromDb(windowRoute.convId) : "");
+    const matchedProj = resolvedRouteProjId ? projects.find((p) => p.id === resolvedRouteProjId) : null;
     if (matchedProj) {
       const effectiveConvId = windowRoute.convId || convId || "";
       const activeWorkspace = (matchedProj.primaryPath || clientWorkspaceUri || "").replace(/\\/g, "/");
@@ -478,10 +482,8 @@ function getSystemState(query = {}) {
   if (!profiles.__meta__) {
     profiles.__meta__ = {};
   }
-  // 彻底清理历史遗留的 convProjectMap 猜测缓存，防止污染真实项目识别
-  if (profiles.__meta__.convProjectMap !== undefined) {
-    delete profiles.__meta__.convProjectMap;
-    profilesModified = true;
+  if (!profiles.__meta__.convProjectMap || typeof profiles.__meta__.convProjectMap !== "object") {
+    profiles.__meta__.convProjectMap = {};
   }
 
   const now = Date.now();
@@ -496,12 +498,23 @@ function getSystemState(query = {}) {
   const isBackgroundTabPassive = Boolean(
     source !== "electron-window-route" &&
     windowRoute &&
+    windowRoute.projectId &&
     windowRoute.convId &&
     convId &&
     convId !== windowRoute.convId
   );
 
   if (!isBackgroundTabPassive && activeProjectId && activeProjectId !== DEFAULT_KEY) {
+    if (effectiveConvId && profiles.__meta__.convProjectMap[effectiveConvId] !== activeProjectId) {
+      profiles.__meta__.convProjectMap[effectiveConvId] = activeProjectId;
+      const mapKeys = Object.keys(profiles.__meta__.convProjectMap);
+      if (mapKeys.length > 120) {
+        for (let i = 0; i < mapKeys.length - 100; i++) {
+          delete profiles.__meta__.convProjectMap[mapKeys[i]];
+        }
+      }
+      profilesModified = true;
+    }
     profiles.__meta__.lastSidecarPollAt = now;
     if (!isPassive) {
       profiles.__meta__.lastSidecarActiveAt = now;

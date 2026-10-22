@@ -89,20 +89,35 @@ try {
 
 const convIdProjectCache = new Map();
 
+let cachedDatabaseSyncCtor = null;
+try {
+  const mod = await import("node:sqlite");
+  cachedDatabaseSyncCtor = mod.DatabaseSync || null;
+} catch (_) {}
+
 function resolveProjectIdFromDb(convId) {
   if (!convId) return "";
   if (convIdProjectCache.has(convId)) {
     const cached = convIdProjectCache.get(convId);
-    if (cached.projectId || (Date.now() - cached.at < 15000)) {
+    // 命中真实 projectId 长期缓存；若上次未命中（""），仅短防抖 800ms，严禁缓存 15s 空结果导致切换历史对话断链
+    if (cached.projectId || (Date.now() - cached.at < 800)) {
       return cached.projectId;
     }
   }
 
-  // 1. 原生 node:sqlite 毫秒级直查（命中则立即缓存并返回；未命中时绝不重复拉起 python 查同一库）
+  // 1. 原生 node:sqlite 毫秒级直查（若常驻连接因 WAL 快照未见新行，自动用短连接复核一次）
   if (sqliteDb) {
     try {
       const stmt = sqliteDb.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?");
-      const row = stmt.get(convId);
+      let row = stmt.get(convId);
+      if ((!row || !row.project_id) && cachedDatabaseSyncCtor && fs.existsSync(CONV_DB_PATH)) {
+        const freshDb = new cachedDatabaseSyncCtor(CONV_DB_PATH, { readOnly: true, open: true });
+        try {
+          row = freshDb.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?").get(convId);
+        } finally {
+          try { freshDb.close(); } catch (_) {}
+        }
+      }
       const pId = (row && row.project_id) ? String(row.project_id) : "";
       if (pId) {
         convIdProjectCache.set(convId, { projectId: pId, at: Date.now() });
@@ -127,6 +142,18 @@ function resolveProjectIdFromDb(convId) {
       }
     } catch (e) {}
   }
+
+  // 2.5 从 profiles.__meta__.convProjectMap 共享映射中快查（由 Hook 或 Sidecar 写入）
+  try {
+    if (fs.existsSync(PROFILES_FILE)) {
+      const prof = JSON.parse(fs.readFileSync(PROFILES_FILE, "utf-8"));
+      const mapped = prof?.__meta__?.convProjectMap?.[convId];
+      if (mapped && typeof mapped === "string") {
+        convIdProjectCache.set(convId, { projectId: mapped, at: Date.now() });
+        return mapped;
+      }
+    }
+  } catch (e) {}
 
   // 3. agentapi CLI 官方探测兜底（仅对尚未入 SQLite 的纯聊天/新会话执行一次，结果写入 convIdProjectCache 防止重复阻塞）
   try {
