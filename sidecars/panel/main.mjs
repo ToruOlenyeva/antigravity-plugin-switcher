@@ -914,9 +914,9 @@ setInterval(bindAdditionalSidecarPorts, 5000);
 let lastObservedRouteSig = "";
 setInterval(async () => {
   try {
-    const lsSynced = await syncNativeSettingsFromLsMemory();
     const route = await refreshFocusedWindowRoute(true);
     if (!route || !route.projectId) {
+      const lsSynced = await syncNativeSettingsFromLsMemory("");
       if (lsSynced) {
         const stateData = getSystemState({ isPassive: false });
         broadcastStateToAllFrontends(stateData, true);
@@ -924,10 +924,16 @@ setInterval(async () => {
       return;
     }
     const sig = `${route.projectId}|${route.convId || ""}`;
-    if (sig !== lastObservedRouteSig || lsSynced) {
+    if (sig !== lastObservedRouteSig) {
       lastObservedRouteSig = sig;
       const stateData = getSystemState({ isPassive: false });
-      broadcastStateToAllFrontends(stateData, Boolean(lsSynced));
+      broadcastStateToAllFrontends(stateData, false);
+      return;
+    }
+    const lsSynced = await syncNativeSettingsFromLsMemory(route.projectId);
+    if (lsSynced) {
+      const stateData = getSystemState({ isPassive: false });
+      broadcastStateToAllFrontends(stateData, true);
     }
   } catch (e) {}
 }, 800);
@@ -935,14 +941,21 @@ setInterval(async () => {
 // 事件驱动监听 config.json 物理变更（fs.watch 毫秒级内核事件 + fs.watchFile 兜底）：
 // 当用户在 Antigravity 原生 Settings 中拨动开关时，无需等待 2.5s 轮询，在 <150ms 内立即捕获并经由 SSE 0ms 广播至内置 Sidecar 与 8088 面板
 function handleExternalConfigFileChange() {
-  if (!isInternalConfigWriteSettled(450)) return;
+  if (!isInternalConfigWriteSettled(600)) return;
   try {
     const profiles = readJsonSafe(PROFILES_FILE, {});
     const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
     if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return;
 
+    const nowMs = Date.now();
     const lastProfileWriteAt = Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0);
-    if (Date.now() - lastProfileWriteAt <= 450) return;
+    const lastSwitchAt = Number(profiles?.__meta__?.lastProjectSwitchAt || 0);
+    const lastBgHookAt = Number(profiles?.__meta__?.lastBgHookAt || 0);
+    if (nowMs - lastProfileWriteAt <= 800 || nowMs - lastSwitchAt <= 1500 || nowMs - lastBgHookAt <= 1500) return;
+
+    const route = getFocusedWindowRoute();
+    if (route && route.projectId && route.projectId !== lastActiveId) return;
+    if (profiles?.__meta__?.lastAppliedProjectId && profiles.__meta__.lastAppliedProjectId !== lastActiveId) return;
 
     const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
     const activeProfile = profiles[lastActiveId];
@@ -960,7 +973,7 @@ function handleExternalConfigFileChange() {
     }
 
     if (changed) {
-      recordConfigWriteMeta(profiles, config);
+      recordConfigWriteMeta(profiles, config, lastActiveId);
       writeJsonSafe(PROFILES_FILE, profiles);
       console.log(`[PluginSwitcher Sidecar] Instant native Settings sync -> project ${lastActiveId}`);
       const stateData = getSystemState({ isPassive: false });

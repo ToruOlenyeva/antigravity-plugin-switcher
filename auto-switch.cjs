@@ -9,11 +9,73 @@ const appDataDir = process.env.APPDATA || (process.platform === "darwin" ? path.
 const APP_STORAGE_FILE = path.join(appDataDir, "Antigravity", "app_storage.json");
 const CONV_DB_PATH = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
 const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
+const profilesBakPath = `${profilesPath}.bak`;
 const configPath = path.join(homeDir, ".gemini", "config", "config.json");
 const projectsDir = path.join(homeDir, ".gemini", "config", "projects");
 
 const PROTECTED_PLUGINS = new Set(["plugin-switcher"]);
 const DEFAULT_KEY = "__default__";
+
+function isWellFormedProfiles(obj) {
+  return Boolean(
+    obj &&
+    typeof obj === "object" &&
+    obj[DEFAULT_KEY] &&
+    obj[DEFAULT_KEY].plugins &&
+    typeof obj[DEFAULT_KEY].plugins === "object" &&
+    Object.keys(obj[DEFAULT_KEY].plugins).length > 0
+  );
+}
+
+function readJsonRobust(filePath, fallback = null, bakPath = "") {
+  for (let i = 0; i < 3; i++) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, "utf-8");
+        if (raw && raw.trim()) {
+          const parsed = JSON.parse(raw);
+          if (!bakPath || isWellFormedProfiles(parsed)) {
+            return parsed;
+          }
+        }
+      }
+    } catch (e) {}
+    const waitUntil = Date.now() + 2;
+    while (Date.now() < waitUntil) {}
+  }
+  if (bakPath && fs.existsSync(bakPath)) {
+    try {
+      const bakParsed = JSON.parse(fs.readFileSync(bakPath, "utf-8"));
+      if (isWellFormedProfiles(bakParsed)) return bakParsed;
+    } catch (e) {}
+  }
+  return fallback;
+}
+
+function writeJsonAtomic(filePath, data, bakPath = "") {
+  try {
+    if (bakPath && !isWellFormedProfiles(data)) return false;
+    const content = JSON.stringify(data, null, 2);
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, content, "utf-8");
+      fs.renameSync(tmpPath, filePath);
+    } catch (err) {
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+      fs.writeFileSync(filePath, content, "utf-8");
+    }
+    if (bakPath) {
+      try {
+        const bakTmp = `${bakPath}.${process.pid}.tmp`;
+        fs.writeFileSync(bakTmp, content, "utf-8");
+        fs.renameSync(bakTmp, bakPath);
+      } catch (e) {}
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -166,16 +228,13 @@ async function main() {
       return reply(defaultReply);
     }
 
-    let profiles = {};
-    try {
-      profiles = JSON.parse(fs.readFileSync(profilesPath, "utf-8"));
-    } catch (e) {
+    const profiles = readJsonRobust(profilesPath, null, profilesBakPath);
+    if (!profiles) {
       return reply(defaultReply);
     }
 
     // 1. 构建包含 ~/.gemini/config/projects 与 profiles 的完整项目列表（自动清除伴生容器空壳项目）
-    let rawConfigForSidecars = {};
-    try { rawConfigForSidecars = JSON.parse(fs.readFileSync(configPath, "utf-8")); } catch (e) {}
+    const rawConfigForSidecars = readJsonRobust(configPath, {}) || {};
     const sidecarProjIds = new Set();
     if (rawConfigForSidecars && rawConfigForSidecars.sidecars && typeof rawConfigForSidecars.sidecars === "object") {
       for (const sc of Object.values(rawConfigForSidecars.sidecars)) {
@@ -405,15 +464,22 @@ async function main() {
     } catch (e) {}
 
     const foregroundSidecarProjId = profiles.__meta__.lastSidecarProjectId || "";
+    const lastSidecarPollAt = Number(profiles.__meta__.lastSidecarPollAt || 0);
+    const isSidecarActivelyTrackingOtherProject = Boolean(
+      foregroundSidecarProjId &&
+      foregroundSidecarProjId !== activeProjectId &&
+      (Date.now() - lastSidecarPollAt < 8000)
+    );
     const isBackgroundConv = Boolean(
+      isSidecarActivelyTrackingOtherProject ||
       (payloadConvId && storageHeadConvId && payloadConvId !== storageHeadConvId) ||
       (foregroundSidecarProjId && foregroundSidecarProjId !== activeProjectId && payloadConvId && payloadConvId !== profiles.__meta__.lastSidecarConvId)
     );
 
-    // 若为后台对话的 pre-tool 调用，绝对不篡改前台活跃项目 ID 与全局 config.json，防止前台面板跳回后台项目
-    if (isBackgroundConv && hookMode === "pre-tool") {
+    // 若为后台对话调用（无论 pre-tool 还是 pre-invocation），当宿主主窗口正聚焦在其他项目时，绝对不篡改前台活跃项目 ID 与全局 config.json，防止把前台项目插件偷偷关掉
+    if (isBackgroundConv) {
       if (metaChanged) {
-        try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
+        writeJsonAtomic(profilesPath, profiles, profilesBakPath);
       }
       return reply(defaultReply);
     }
@@ -439,11 +505,16 @@ async function main() {
     }
 
     if (lastActiveId !== activeProjectId || hasDiff) {
-      if (!isBackgroundConv) {
+      const nowMs = Date.now();
+      if (activeProjectId && activeProjectId !== DEFAULT_KEY) {
+        if (lastActiveId !== activeProjectId) {
+          profiles.__meta__.lastProjectSwitchAt = nowMs;
+        }
         profiles.__meta__.lastActiveProjectId = activeProjectId;
+        profiles.__meta__.lastAppliedProjectId = activeProjectId;
       }
-      profiles.__meta__.lastBgHookAt = Date.now();
-      profiles.__meta__.lastInternalConfigWriteAt = Date.now();
+      profiles.__meta__.lastBgHookAt = nowMs;
+      profiles.__meta__.lastInternalConfigWriteAt = nowMs;
       const snap = {};
       for (const [k, v] of Object.entries(configObj.plugins || {})) {
         if (k.startsWith(".") || PROTECTED_PLUGINS.has(k)) continue;
@@ -453,18 +524,17 @@ async function main() {
       metaChanged = true;
     }
 
-    if (hasDiff) {
-      fs.writeFileSync(configPath, JSON.stringify(configObj, null, 2), "utf-8");
-    }
-
+    // 必须先写 profiles.json（锁定时间戳与新快照），再写 config.json，防止 Sidecar 的 fs.watch 读到旧快照产生反向误判！
     if (metaChanged) {
-      try { fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2), "utf-8"); } catch (e) {}
+      writeJsonAtomic(profilesPath, profiles, profilesBakPath);
     }
 
     if (hasDiff) {
+      writeJsonAtomic(configPath, configObj);
 
-      const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "localhost:5387";
-      const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
+      const savedTarget = profiles.__meta__.lsRpcTarget || {};
+      const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || (savedTarget.port ? `${savedTarget.hostname || "127.0.0.1"}:${savedTarget.port}` : "localhost:5387");
+      const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || savedTarget.csrf || "";
 
       if (csrf && Object.keys(rpcUpdates).length > 0) {
         try {

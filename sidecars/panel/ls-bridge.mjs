@@ -334,12 +334,73 @@ function getFocusedWindowRoute() {
 // 启动时立即探测一次主窗口路由
 refreshFocusedWindowRoute(true).catch(() => {});
 
+const lastValidJsonCache = new Map();
+const PROFILES_BAK_FILE = `${PROFILES_FILE}.bak`;
+
+function isWellFormedProfilesObject(obj) {
+  return Boolean(
+    obj &&
+    typeof obj === "object" &&
+    !Array.isArray(obj) &&
+    obj[DEFAULT_KEY] &&
+    typeof obj[DEFAULT_KEY] === "object" &&
+    obj[DEFAULT_KEY].plugins &&
+    typeof obj[DEFAULT_KEY].plugins === "object" &&
+    Object.keys(obj[DEFAULT_KEY].plugins).length > 0
+  );
+}
+
+function countUuidProjectKeys(obj) {
+  if (!obj || typeof obj !== "object") return 0;
+  let count = 0;
+  for (const k of Object.keys(obj)) {
+    if (/^[0-9a-f-]{36}$/i.test(k)) count++;
+  }
+  return count;
+}
+
 function readJsonSafe(filePath, fallback = {}) {
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, "utf-8"));
-    }
-  } catch (e) {}
+  const isProfiles = filePath === PROFILES_FILE;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, "utf-8");
+        if (raw && raw.trim()) {
+          const parsed = JSON.parse(raw);
+          if (!isProfiles || isWellFormedProfilesObject(parsed)) {
+            lastValidJsonCache.set(filePath, raw);
+            return parsed;
+          }
+        }
+      }
+    } catch (e) {}
+    // 短暂自旋等待并发写盘完成（约 2ms）
+    const waitUntil = Date.now() + 2;
+    while (Date.now() < waitUntil) {}
+  }
+
+  // 防线 1：若读取发生瞬时并发截断或半截 JSON，优先从进程内最后一次合法快照恢复，绝不裸返空对象 {}
+  if (lastValidJsonCache.has(filePath)) {
+    try {
+      return JSON.parse(lastValidJsonCache.get(filePath));
+    } catch (e) {}
+  }
+
+  // 防线 2：针对 PROFILES_FILE 额外从磁盘 .bak 热备恢复
+  if (isProfiles && fs.existsSync(PROFILES_BAK_FILE)) {
+    try {
+      const bakRaw = fs.readFileSync(PROFILES_BAK_FILE, "utf-8");
+      const bakParsed = JSON.parse(bakRaw);
+      if (isWellFormedProfilesObject(bakParsed)) {
+        lastValidJsonCache.set(filePath, bakRaw);
+        try {
+          fs.writeFileSync(PROFILES_FILE, bakRaw, "utf-8");
+        } catch (e) {}
+        return bakParsed;
+      }
+    } catch (e) {}
+  }
+
   return fallback;
 }
 
@@ -407,6 +468,36 @@ function resolvePluginLogoUrl(dir, manifest = {}) {
 let lastInternalConfigWriteMs = 0;
 let inflightLsRpcCount = 0;
 let lastLsRpcDoneMs = 0;
+let cachedLsRpcTarget = null;
+let cachedLsRpcTargetAt = 0;
+
+function resolveLsRpcTarget(profilesHint = null) {
+  const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "";
+  const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
+  if (envAddr && envCsrf) {
+    const [hostname, portStr] = envAddr.split(":");
+    const port = Number(portStr || 5387);
+    if (hostname && port > 0) {
+      cachedLsRpcTarget = { hostname, port, csrf: envCsrf };
+      cachedLsRpcTargetAt = Date.now();
+      return cachedLsRpcTarget;
+    }
+  }
+  if (cachedLsRpcTarget && (Date.now() - cachedLsRpcTargetAt < 30000)) {
+    return cachedLsRpcTarget;
+  }
+  const metaTarget = profilesHint?.__meta__?.lsRpcTarget;
+  if (metaTarget && metaTarget.port && metaTarget.csrf) {
+    cachedLsRpcTarget = {
+      hostname: metaTarget.hostname || "127.0.0.1",
+      port: Number(metaTarget.port),
+      csrf: String(metaTarget.csrf)
+    };
+    cachedLsRpcTargetAt = Date.now();
+    return cachedLsRpcTarget;
+  }
+  return null;
+}
 
 function extractConfigPluginSnapshot(config) {
   const snap = {};
@@ -419,34 +510,88 @@ function extractConfigPluginSnapshot(config) {
   return snap;
 }
 
-function recordConfigWriteMeta(profiles, config) {
+function recordConfigWriteMeta(profiles, config, appliedProjectId = "") {
   if (!profiles || typeof profiles !== "object") return;
   if (!profiles.__meta__) profiles.__meta__ = {};
   const now = Date.now();
   lastInternalConfigWriteMs = now;
   profiles.__meta__.lastInternalConfigWriteAt = now;
   profiles.__meta__.lastAppliedConfigSnapshot = extractConfigPluginSnapshot(config);
+  if (appliedProjectId && appliedProjectId !== DEFAULT_KEY) {
+    profiles.__meta__.lastAppliedProjectId = appliedProjectId;
+  } else if (profiles.__meta__.lastActiveProjectId) {
+    profiles.__meta__.lastAppliedProjectId = profiles.__meta__.lastActiveProjectId;
+  }
+  const target = resolveLsRpcTarget(profiles);
+  if (target) {
+    profiles.__meta__.lsRpcTarget = {
+      hostname: target.hostname,
+      port: target.port,
+      csrf: target.csrf,
+      updatedAt: now
+    };
+  }
+}
+
+function writeFileAtomicSync(targetPath, content) {
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, content, "utf-8");
+    fs.renameSync(tmpPath, targetPath);
+    return true;
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch (e) {}
+    try {
+      fs.writeFileSync(targetPath, content, "utf-8");
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
 }
 
 function writeJsonSafe(filePath, data) {
   try {
+    if (filePath === PROFILES_FILE) {
+      // 硬熔断：绝不允许将缺失 DEFAULT_KEY 或空插件列表的残缺对象写入 PROFILES_FILE
+      if (!isWellFormedProfilesObject(data)) {
+        return false;
+      }
+      // 防全量丢失熔断：若缓存或备份中已有 >= 2 个项目独立配置，而待写入对象项目数为 0，立即拒绝写盘
+      const prevRaw = lastValidJsonCache.get(PROFILES_FILE);
+      if (prevRaw) {
+        try {
+          const prevObj = JSON.parse(prevRaw);
+          if (countUuidProjectKeys(prevObj) >= 2 && countUuidProjectKeys(data) === 0) {
+            return false;
+          }
+        } catch (e) {}
+      }
+    }
     if (filePath === CONFIG_FILE) {
       lastInternalConfigWriteMs = Date.now();
     }
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-    return true;
+    const serialized = JSON.stringify(data, null, 2);
+    const ok = writeFileAtomicSync(filePath, serialized);
+    if (ok) {
+      lastValidJsonCache.set(filePath, serialized);
+      if (filePath === PROFILES_FILE && countUuidProjectKeys(data) > 0) {
+        writeFileAtomicSync(PROFILES_BAK_FILE, serialized);
+      }
+    }
+    return ok;
   } catch (e) {
     return false;
   }
 }
 
-function notifyLanguageServer(pluginUpdates) {
-  const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "localhost:5387";
-  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
-  if (!csrf) return;
+function notifyLanguageServer(pluginUpdates, profilesHint = null) {
+  const target = resolveLsRpcTarget(profilesHint);
+  if (!target || !target.csrf) return;
 
   try {
-    const [hostname, portStr] = lsAddr.split(":");
     inflightLsRpcCount++;
     let settled = false;
     const markSettled = () => {
@@ -456,13 +601,13 @@ function notifyLanguageServer(pluginUpdates) {
       lastLsRpcDoneMs = Date.now();
     };
     const req = http.request({
-      hostname,
-      port: Number(portStr || 5387),
+      hostname: target.hostname,
+      port: Number(target.port || 5387),
       path: "/exa.language_server_pb.LanguageServerService/JetboxWriteState",
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-codeium-csrf-token": csrf
+        "x-codeium-csrf-token": target.csrf
       },
       timeout: 1000
     }, (res) => {
@@ -488,24 +633,22 @@ export function isInternalConfigWriteSettled(minSettleMs = 450) {
   return (Date.now() - Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs)) > minSettleMs;
 }
 
-export function syncNativeSettingsFromLsMemory() {
-  const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "";
-  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
-  if (!lsAddr || !csrf || !isInternalConfigWriteSettled(450)) {
+export function syncNativeSettingsFromLsMemory(expectedProjectId = "") {
+  const target = resolveLsRpcTarget();
+  if (!target || !target.csrf || !isInternalConfigWriteSettled(600)) {
     return Promise.resolve(false);
   }
 
   return new Promise((resolve) => {
     try {
-      const [hostname, portStr] = lsAddr.split(":");
       const req = http.request({
-        hostname,
-        port: Number(portStr || 5387),
+        hostname: target.hostname,
+        port: Number(target.port || 5387),
         path: "/exa.language_server_pb.LanguageServerService/GetAllPlugins",
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-codeium-csrf-token": csrf
+          "x-codeium-csrf-token": target.csrf
         },
         timeout: 450
       }, (res) => {
@@ -518,18 +661,27 @@ export function syncNativeSettingsFromLsMemory() {
         res.on("data", (chunk) => { body += chunk; });
         res.on("end", () => {
           try {
-            if (!isInternalConfigWriteSettled(450)) return resolve(false);
+            if (!isInternalConfigWriteSettled(600)) return resolve(false);
             const data = JSON.parse(body);
             const list = data?.plugins || data?.pluginInfos || data?.items || [];
             if (!Array.isArray(list) || list.length === 0) return resolve(false);
 
             const profiles = readJsonSafe(PROFILES_FILE, {});
             const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
-            if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return resolve(false);
+            if (!lastActiveId || lastActiveId === DEFAULT_KEY || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return resolve(false);
+            if (expectedProjectId && expectedProjectId !== lastActiveId) return resolve(false);
+            if (profiles?.__meta__?.lastAppliedProjectId && profiles.__meta__.lastAppliedProjectId !== lastActiveId) return resolve(false);
+
+            const nowMs = Date.now();
             const lastProfileWriteAt = Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0);
-            if (Date.now() - lastProfileWriteAt <= 450) return resolve(false);
+            const lastSwitchAt = Number(profiles?.__meta__?.lastProjectSwitchAt || 0);
+            const lastBgHookAt = Number(profiles?.__meta__?.lastBgHookAt || 0);
+            if (nowMs - lastProfileWriteAt <= 1200 || nowMs - lastSwitchAt <= 2000 || nowMs - lastBgHookAt <= 2000) {
+              return resolve(false);
+            }
 
             const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
+            if (!snap) return resolve(false);
             const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
             if (!config.plugins) config.plugins = {};
             const activeProfile = profiles[lastActiveId];
@@ -539,10 +691,16 @@ export function syncNativeSettingsFromLsMemory() {
               const rawKey = item?.id || item?.name || item?.pluginId || item?.directory || "";
               const dir = String(rawKey).split("@")[0].trim();
               if (!dir || PROTECTED_PLUGINS.has(dir) || !isValidPluginDirectory(dir)) continue;
-              if (typeof item?.enabled !== "boolean") continue;
-              const enabledInLs = item.enabled;
-              const divergedFromSnapshot = !snap || snap[dir] === undefined || Boolean(snap[dir]) !== enabledInLs;
-              if (divergedFromSnapshot && activeProfile.plugins[dir] !== enabledInLs) {
+              const enabledInLs = typeof item?.userConfig?.enabled === "boolean"
+                ? item.userConfig.enabled
+                : (typeof item?.disabled === "boolean" ? !item.disabled : item?.enabled);
+              if (typeof enabledInLs !== "boolean") continue;
+              if (snap[dir] === undefined) continue;
+              const profileVal = Boolean(activeProfile.plugins[dir]);
+              const configVal = Boolean(config.plugins?.[dir]?.enabled !== false);
+              // 仅当基准快照、config.json 与当前项目 Profile 三者完全一致（确认为同项目稳定基线），且 LS 内存值偏离该基线时，才认定为用户在原生 Settings 中手动拨动了开关
+              if (Boolean(snap[dir]) !== profileVal || configVal !== profileVal) continue;
+              if (enabledInLs !== profileVal) {
                 activeProfile.plugins[dir] = enabledInLs;
                 if (!config.plugins[dir]) config.plugins[dir] = {};
                 config.plugins[dir].enabled = enabledInLs;
@@ -551,9 +709,9 @@ export function syncNativeSettingsFromLsMemory() {
             }
 
             if (changed) {
-              writeJsonSafe(CONFIG_FILE, config);
-              recordConfigWriteMeta(profiles, config);
+              recordConfigWriteMeta(profiles, config, lastActiveId);
               writeJsonSafe(PROFILES_FILE, profiles);
+              writeJsonSafe(CONFIG_FILE, config);
               return resolve(true);
             }
             resolve(false);
@@ -579,6 +737,7 @@ export {
   PLUGINS_DIR,
   CONFIG_FILE,
   PROFILES_FILE,
+  PROFILES_BAK_FILE,
   PROJECTS_DIR,
   APP_STORAGE_FILE,
   DEVTOOLS_ACTIVE_PORT_FILE,

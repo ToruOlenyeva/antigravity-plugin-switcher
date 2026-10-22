@@ -104,7 +104,10 @@ Sidecar 优先通过 Antigravity 宿主暴露的标准 Chromium 调试接口直�
 3. <b>防线 3：配置快照比对与后台 Hook 冷却锁（<code>lastAppliedConfigSnapshot</code> + <code>lastBgHookAt</code>）</b>
    - 当后台项目 A 的钩子临时改写 <code>config.json</code> 时，会在 <code>project-plugin-profiles.json</code> 的 <code>__meta__</code> 中同步记录配置快照 <code>lastAppliedConfigSnapshot</code> 与时间戳 <code>lastBgHookAt</code>。
    - 此时前台展示项目 B 的 Sidecar 面板通过比对发现当前 <code>config.json</code> 等于 <code>lastAppliedConfigSnapshot</code>（<code>divergedFromSnapshot === false</code>），即可精准判定该变更是由后台项目 A 的钩子触发（而非用户在 Antigravity 原生设置界面手动点击），因此<b>绝不会将项目 A 的开关状态反向覆盖进项目 B 的预设档案</b>，并在前台自愈周期内将 <code>config.json</code> 恢复为项目 B 的配置。
-   - 反之，仅当用户在 Antigravity 原生 Settings 界面真实手动拨动了插件开关（导致 <code>config.json</code> 与 <code>lastAppliedConfigSnapshot</code> 发生偏离 <code>divergedFromSnapshot === true</code>，且已渡过 <code>2.5s</code> 后台冷却窗），<code>scanner.mjs</code> 与 <code>main.mjs</code> 的 <code>fs.watchFile(CONFIG_FILE)</code> 才会将该次手动修改沉淀入当前活跃项目的专属档案。
+   - 反之，当用户在 Antigravity 原生 Settings 界面真实手动拨动了插件开关（导致 <code>config.json</code> 与 <code>lastAppliedConfigSnapshot</code> 发生偏离 <code>divergedFromSnapshot === true</code>，且已渡过 <code>450ms</code> 内部写盘回声护栏），<code>main.mjs</code> 的零轮询原生 <code>fs.watch(CONFIG_DIR)</code> 事件驱动监听器与 Language Server 内存态直读接口 <code>GetAllPlugins</code>（<code>syncNativeSettingsFromLsMemory()</code>）会在 <code>&lt; 150ms</code> 内即时捕获变更、沉淀入当前活跃项目的专属档案并通过 SSE <code>0ms</code> 推送全端面板翻转。
+4. <b>防线 4：原子写盘（<code>.tmp</code> + <code>renameSync</code>）、<code>.bak</code> 热备与全量重置硬熔断（防并发截断覆盖）</b>
+   - <b>消灭非原子截断竞态</b>：<code>ls-bridge.mjs</code> 与 <code>auto-switch.cjs</code> 对 <code>project-plugin-profiles.json</code> 及 <code>config.json</code> 统一采用同目录临时文件 <code>.tmp.${pid}</code> 写入加 <code>fs.renameSync</code> 原子替换，并在确认结构完整后同步备份至 <code>project-plugin-profiles.json.bak</code>。
+   - <b>三级容错读取与写盘熔断</b>：<code>readJsonSafe</code> / <code>readJsonRobust</code> 内置 3 次瞬态重试、进程内 <code>lastValidJsonCache</code> 缓存与 <code>.bak</code> 自动回退，确保已存在的配置档案绝不因并发读取返回空对象 <code>{}</code>；同时在 <code>getSystemState()</code> 与 <code>writeJsonSafe()</code> 设立全量重置熔断器（<code>allowProfilesDiskWrite</code>），一旦检测到已有配置档案缺失 <code>__default__</code> 或 UUID 项目数骤降为 0，立即拒绝写盘，彻底根绝当前活跃项目配置意外覆盖默认配置与全量独立档案。
 
 ### 3.2 面板「当前活跃项目 (<code>●</code>)」与「下拉框预览/编辑项目」解耦机制
 - <b>绿点与下拉框物理分离</b>：

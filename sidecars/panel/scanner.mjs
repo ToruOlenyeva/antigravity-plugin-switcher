@@ -353,10 +353,19 @@ function getSystemState(query = {}) {
     isInit = query.isInit === true;
   }
   const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
+  const profilesFileExistedOnDisk = fs.existsSync(PROFILES_FILE) || fs.existsSync(`${PROFILES_FILE}.bak`);
   const rawProfiles = readJsonSafe(PROFILES_FILE, {});
+  const hadValidDefaultOnRead = Boolean(
+    rawProfiles &&
+    rawProfiles[DEFAULT_KEY] &&
+    rawProfiles[DEFAULT_KEY].plugins &&
+    Object.keys(rawProfiles[DEFAULT_KEY].plugins).length > 0
+  );
+  // 若磁盘上原本已存在配置文件但本次读取未能拿到合法的 DEFAULT_KEY（极端并发异常），严禁将本次用 config.json 临时兜底的对象写回磁盘覆盖用户配置！
+  const allowProfilesDiskWrite = !profilesFileExistedOnDisk || hadValidDefaultOnRead;
 
-  // 1. 初始化纯净基准默认配置（动态发现已安装插件）
-  if (!rawProfiles[DEFAULT_KEY] || rawProfiles[DEFAULT_KEY].name !== "默认配置") {
+  // 1. 初始化纯净基准默认配置（仅在真正首次安装、磁盘尚无任何配置文件时才从当前已安装插件初始化）
+  if (!hadValidDefaultOnRead || rawProfiles[DEFAULT_KEY].name !== "默认配置") {
     const initialDefaultPlugins = {};
     if (fs.existsSync(PLUGINS_DIR)) {
       for (const entry of fs.readdirSync(PLUGINS_DIR, { withFileTypes: true })) {
@@ -369,7 +378,7 @@ function getSystemState(query = {}) {
       id: DEFAULT_KEY,
       name: "默认配置",
       paths: [],
-      plugins: (rawProfiles[DEFAULT_KEY] && rawProfiles[DEFAULT_KEY].plugins) || initialDefaultPlugins
+      plugins: hadValidDefaultOnRead ? rawProfiles[DEFAULT_KEY].plugins : initialDefaultPlugins
     };
   }
 
@@ -531,7 +540,7 @@ function getSystemState(query = {}) {
           }
         }
       } else {
-        // 分支 A：跨项目切换跃变！正向将该项目的独立配置写入 config.json
+        // 分支 A：跨项目切换跃变！正向将该项目的独立配置写入 config.json，并强制同步 LS 内存态
         if (!config.plugins) config.plugins = {};
         const rpcUpdates = {};
         let configChanged = false;
@@ -541,15 +550,27 @@ function getSystemState(query = {}) {
           if (!config.plugins[pluginDir]) config.plugins[pluginDir] = {};
           const cur = config.plugins[pluginDir].enabled !== false;
           const target = Boolean(shouldEnable);
+          rpcUpdates[pluginDir] = { enabled: target };
           if (cur !== target) {
             config.plugins[pluginDir].enabled = target;
-            rpcUpdates[pluginDir] = { enabled: target };
             configChanged = true;
           }
         }
 
+        // 先更新并落盘 profiles 元数据（含 lastProjectSwitchAt、lastInternalConfigWriteAt、lastAppliedProjectId），防止 config.json 触发 fs.watch 时读到旧快照
+        profiles.__meta__.lastActiveProjectId = activeProjectId;
+        profiles.__meta__.lastProjectSwitchAt = Date.now();
+        recordConfigWriteMeta(profiles, config, activeProjectId);
+        profilesModified = true;
+        if (allowProfilesDiskWrite) {
+          writeJsonSafe(PROFILES_FILE, profiles);
+          profilesModified = false;
+        }
+
         if (configChanged) {
           writeJsonSafe(CONFIG_FILE, config);
+        }
+        if (Object.keys(rpcUpdates).length > 0) {
           notifyLanguageServer(rpcUpdates);
         }
 
@@ -559,20 +580,26 @@ function getSystemState(query = {}) {
             p.enabled = Boolean(activeProfile.plugins[p.dir]);
           }
         }
-
-        recordConfigWriteMeta(profiles, config);
-        profiles.__meta__.lastActiveProjectId = activeProjectId;
-        profilesModified = true;
       }
     } else {
       // 分支 B：停留在同一项目内！通过比对 lastAppliedConfigSnapshot 区分「用户在软件原生设置中手动改开关」与「跨项目残留状态」
       const nowMs = Date.now();
       const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
       const lastProfileWriteAt = Number(profiles.__meta__.lastInternalConfigWriteAt || 0);
-      // 1) 原生 Settings 手动拨动（divergedFromSnapshot === true）：仅需本插件内部 RPC 与写盘静默 450ms 即可秒级放行，彻底告别 2.5s 死等
-      const canSyncNativeToggle = isInternalConfigWriteSettled(450) && (nowMs - lastProfileWriteAt > 450);
-      // 2) 后台其他项目 Hook 瞬态下发残留（divergedFromSnapshot === false）：保持 2500ms 保护窗口后再自愈回写前台项目配置
-      const canRepairBgResidual = canSyncNativeToggle && (nowMs - lastBgHookAt > 2500);
+      const lastSwitchAt = Number(profiles.__meta__.lastProjectSwitchAt || 0);
+      const snapshotOwnerMatches = !profiles.__meta__.lastAppliedProjectId || profiles.__meta__.lastAppliedProjectId === activeProjectId;
+      // 1) 原生 Settings 手动拨动（divergedFromSnapshot === true）：需内部写盘静默 600ms 且距上次跨项目切换 > 1500ms 且距后台 Hook > 1500ms
+      const canSyncNativeToggle =
+        snapshotOwnerMatches &&
+        isInternalConfigWriteSettled(600) &&
+        (nowMs - lastProfileWriteAt > 800) &&
+        (nowMs - lastSwitchAt > 1500) &&
+        (nowMs - lastBgHookAt > 1500);
+      // 2) 后台其他项目 Hook 瞬态下发残留或 LS 滞后残留：主动自愈回写前台项目配置
+      const canRepairBgResidual =
+        isInternalConfigWriteSettled(600) &&
+        (nowMs - lastProfileWriteAt > 800) &&
+        (nowMs - lastBgHookAt > 1500);
 
       if (canSyncNativeToggle) {
         const snap = profiles.__meta__.lastAppliedConfigSnapshot || null;
@@ -617,7 +644,7 @@ function getSystemState(query = {}) {
     }
   }
 
-  if (profilesModified) {
+  if (profilesModified && allowProfilesDiskWrite) {
     writeJsonSafe(PROFILES_FILE, profiles);
   }
 
