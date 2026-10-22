@@ -12,6 +12,8 @@ import {
   PRELOAD_SDK_PATH,
   isValidPluginDirectory,
   resolveProjectIdFromDb,
+  getFocusedWindowRoute,
+  refreshFocusedWindowRoute,
   readJsonSafe,
   getPluginManifest,
   resolvePluginLogoFile,
@@ -274,10 +276,12 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 3. 状态接口（内置 Sidecar 计算出的同一份状态直接缓存并通过 SSE 0ms 双输出给 8088）
+  // 3. 状态接口（由 Electron 主窗口实时路由作为唯一真实源，内置 Sidecar 与 8088 端口 100% 同源输出）
   if (req.method === "GET" && pathname === "/api/status") {
     try {
       const startMs = Date.now();
+      await refreshFocusedWindowRoute(false);
+
       const isStandalone8088 = Boolean(
         req.socket?.localPort === 8088 ||
         (req.headers.host || "").endsWith(":8088") ||
@@ -294,35 +298,20 @@ async function requestHandler(req, res) {
       const isPassive = hasActiveFlag ? false : hasPassiveFlag;
       const isInit = !isStandalone8088 && url.searchParams.get("init") === "1";
 
-      let stateData;
-      if (isStandalone8088 && !clientProjectId && latestDualOutputState) {
-        // 8088 独立端口：直接复用内置 Sidecar 最新输出的同一份 activeProjectId 与会话上下文
-        stateData = getSystemState({
-          clientProjectId: latestDualOutputState.activeProjectId,
-          convId: latestDualOutputState.activeConversationId || "",
-          cid: "browser_8088",
-          isPassive: true
-        });
-      } else {
-        stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag, isInit });
-        if (!isStandalone8088) {
-          broadcastStateToAllFrontends(stateData);
-        }
-      }
+      const stateData = getSystemState({ convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, cid, isPassive, hasActiveFlag, isInit });
+      broadcastStateToAllFrontends(stateData);
 
+      const routeInfo = getFocusedWindowRoute();
       const elapsedMs = Date.now() - startMs;
       if (!globalThis.__switcherDebugTrace) globalThis.__switcherDebugTrace = [];
       globalThis.__switcherDebugTrace.push({
         at: new Date().toISOString(),
         elapsedMs,
         cid,
-        token: token ? token.slice(0, 8) : "",
         convId: convId ? convId.slice(0, 8) : "",
-        ws: clientWorkspaceUri,
-        sidecarProjectId: sidecarProjectId ? sidecarProjectId.slice(0, 8) : "",
-        isPassive,
-        hasActiveFlag,
-        isInit,
+        routePort: routeInfo.port,
+        routeConvId: routeInfo.convId ? routeInfo.convId.slice(0, 8) : "",
+        routeProjId: routeInfo.projectId ? routeInfo.projectId.slice(0, 8) : "",
         resolvedActiveProjectId: stateData.activeProjectId,
         resolvedConvId: stateData.activeConversationId
       });
@@ -918,6 +907,21 @@ function bindAdditionalSidecarPorts() {
 
 bindAdditionalSidecarPorts();
 setInterval(bindAdditionalSidecarPorts, 5000);
+
+// 常驻 800ms 监听 Antigravity Electron 主窗口路由跃变：哪怕内置 Sidecar 面板完全关闭，切项目或切会话也会在 0.8s 内自动切换配置并通过 SSE 推送给 8088 与所有活跃面板
+let lastObservedRouteSig = "";
+setInterval(async () => {
+  try {
+    const route = await refreshFocusedWindowRoute(true);
+    if (!route || !route.projectId) return;
+    const sig = `${route.projectId}|${route.convId || ""}`;
+    if (sig !== lastObservedRouteSig) {
+      lastObservedRouteSig = sig;
+      const stateData = getSystemState({ isPassive: false });
+      broadcastStateToAllFrontends(stateData);
+    }
+  } catch (e) {}
+}, 800);
 
 // 后台监听 config.json 物理变更：仅当 config.json 相比本插件最后一次下发的快照（lastAppliedConfigSnapshot）发生真实偏离时，才认定为用户在原生 Settings 中手动拨动了开关
 try {

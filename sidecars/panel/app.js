@@ -1222,7 +1222,7 @@
         // 即时渲染卡片
         onSelectProject();
 
-        // 挂载 SSE 实时双输出监听（后端给内置 Sidecar 输出状态的同时，0ms 同步推送到 8088 独立页面）
+        // 挂载 SSE 实时双输出监听（后端基于主窗口实时路由算出的同一份 stateData 0ms 同步推送到内置 Sidecar 与 8088 独立页面）
         if (!window.__sseSource && typeof window.EventSource === "function") {
           try {
             const es = new EventSource("/api/events");
@@ -1230,10 +1230,7 @@
               if (!isPanelActuallyVisible()) return;
               try {
                 const pushedState = JSON.parse(ev.data);
-                // 8088 独立页面或未锁死特定会话的面板直接 0ms 应用后端双输出状态
-                if (!isEmbeddedSidecar || !lockedSidecarConvId || pushedState.activeConversationId === lockedSidecarConvId) {
-                  applyIncomingStateData(pushedState);
-                }
+                applyIncomingStateData(pushedState);
               } catch (e) {}
             };
             window.__sseSource = es;

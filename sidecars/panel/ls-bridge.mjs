@@ -57,6 +57,8 @@ const CONFIG_FILE = path.join(homeDir, ".gemini", "config", "config.json");
 const PROFILES_FILE = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
 const PROJECTS_DIR = path.join(homeDir, ".gemini", "config", "projects");
 const APP_STORAGE_FILE = path.join(appDataDir, "Antigravity", "app_storage.json");
+const DEVTOOLS_ACTIVE_PORT_FILE = path.join(appDataDir, "Antigravity", "DevToolsActivePort");
+const LS_LOG_FILE = path.join(appDataDir, "Antigravity", "logs", "language_server.log");
 const CONV_DB_PATH = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
 const PROTECTED_PLUGINS = new Set(["plugin-switcher"]);
 const DEFAULT_KEY = "__default__";
@@ -155,31 +157,182 @@ function getLatestActiveProjectIdFromDb() {
       }
     } catch (e) {}
   }
-  try {
-    if (fs.existsSync(CONV_DB_PATH)) {
-      const pyScript = "import sqlite3, sys; conn = sqlite3.connect(sys.argv[1]); c = conn.cursor(); c.execute('SELECT project_id FROM conversation_summaries ORDER BY last_user_input_time DESC LIMIT 1'); r = c.fetchone(); print(r[0] if r else '')";
-      const out = execFileSync("python", ["-c", pyScript, CONV_DB_PATH], {
-        encoding: "utf-8",
-        timeout: 1000,
-        windowsHide: true
-      });
-      const pId = out.trim();
-      if (pId) return pId;
-    }
-  } catch (e) {}
   return "";
 }
 
-function getActiveConversationIdFromStorage() {
+// 动态发现 Antigravity Electron 主窗口的本地 CDP 端口（绝不写死端口）
+// 优先级 1：读取 Chromium 官方标准动态端口文件 <AppData>/Antigravity/DevToolsActivePort 第 1 行
+// 优先级 2：从 <AppData>/Antigravity/logs/language_server.log 尾部提取最新 WS URL 端口
+let cachedCdpPort = 0;
+let cachedCdpPortAt = 0;
+
+function discoverElectronCdpPort(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedCdpPort > 1024 && (now - cachedCdpPortAt < 5000)) {
+    return cachedCdpPort;
+  }
+
+  // 1. 首选读取 DevToolsActivePort 第一行（每次客户端重启分配随机端口都会自动刷新该文件）
   try {
-    const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
-    const convOrder = JSON.parse(appStorage.projectsConversationOrder || "[]");
-    if (Array.isArray(convOrder) && convOrder.length > 0) {
-      return convOrder[0] || "";
+    if (fs.existsSync(DEVTOOLS_ACTIVE_PORT_FILE)) {
+      const raw = fs.readFileSync(DEVTOOLS_ACTIVE_PORT_FILE, "utf-8");
+      const firstLine = (raw.split(/\r?\n/)[0] || "").trim();
+      const port = Number(firstLine);
+      if (port > 1024 && port < 65535) {
+        cachedCdpPort = port;
+        cachedCdpPortAt = now;
+        return port;
+      }
     }
   } catch (e) {}
-  return "";
+
+  // 2. 次选从 language_server.log 尾部动态提取
+  try {
+    if (fs.existsSync(LS_LOG_FILE)) {
+      const stat = fs.statSync(LS_LOG_FILE);
+      const readSize = Math.min(stat.size, 24576);
+      const fd = fs.openSync(LS_LOG_FILE, "r");
+      const buf = Buffer.alloc(readSize);
+      fs.readSync(fd, buf, 0, readSize, Math.max(0, stat.size - readSize));
+      fs.closeSync(fd);
+      const tail = buf.toString("utf-8");
+      const matches = [...tail.matchAll(/ws:\/\/127\.0\.0\.1:(\d+)\/devtools\/browser\//g)];
+      if (matches.length > 0) {
+        const port = Number(matches[matches.length - 1][1]);
+        if (port > 1024 && port < 65535) {
+          cachedCdpPort = port;
+          cachedCdpPortAt = now;
+          return port;
+        }
+      }
+    }
+  } catch (e) {}
+
+  return cachedCdpPort || 13305;
 }
+
+let latestWindowRoute = {
+  projectId: "",
+  convId: "",
+  sectionProjId: "",
+  rawUrl: "",
+  title: "",
+  port: 0,
+  updatedAt: 0
+};
+let inflightRoutePromise = null;
+
+function fetchCdpTargetsJson(port) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({
+      hostname: "127.0.0.1",
+      port,
+      path: "/json",
+      timeout: 300
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      let body = "";
+      res.setEncoding("utf-8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("timeout"));
+    });
+    req.on("error", reject);
+  });
+}
+
+// 实时读取 Antigravity Electron 主窗口 page 路由 (/c/<convId>?section=<projectId>)
+async function refreshFocusedWindowRoute(force = false) {
+  const now = Date.now();
+  if (!force && latestWindowRoute.updatedAt > 0 && (now - latestWindowRoute.updatedAt < 250)) {
+    return latestWindowRoute;
+  }
+  if (inflightRoutePromise) return inflightRoutePromise;
+
+  inflightRoutePromise = (async () => {
+    let port = discoverElectronCdpPort(false);
+    let targets = null;
+    try {
+      targets = await fetchCdpTargetsJson(port);
+    } catch (e) {
+      // 若缓存端口失效（如客户端重启换了新随机端口），强制重读 DevToolsActivePort 重试一次
+      const freshPort = discoverElectronCdpPort(true);
+      if (freshPort !== port) {
+        port = freshPort;
+        try {
+          targets = await fetchCdpTargetsJson(port);
+        } catch (e2) {}
+      }
+    }
+
+    if (Array.isArray(targets)) {
+      const pageTarget = targets.find((t) =>
+        t &&
+        t.type === "page" &&
+        typeof t.url === "string" &&
+        (t.url.includes("/c/") || t.url.includes("section=") || (t.title || "").includes("Antigravity"))
+      );
+      if (pageTarget && pageTarget.url) {
+        const rawUrl = pageTarget.url;
+        const convMatch = rawUrl.match(/\/c\/([0-9a-f-]{36})/i);
+        const secMatch = rawUrl.match(/[?&]section=([0-9a-f-]{36})/i);
+        const convId = convMatch ? convMatch[1] : "";
+        const sectionProjId = secMatch ? secMatch[1] : "";
+
+        // 先查 SQLite 确认会话归属；若为尚未落库的新会话/纯聊天会话，则直接用路由中的 ?section=<projectId> 注入内存缓存，0ms 免拉起子进程
+        let dbProjId = "";
+        if (convId && sqliteDb) {
+          try {
+            const stmt = sqliteDb.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?");
+            const row = stmt.get(convId);
+            if (row && row.project_id) {
+              dbProjId = String(row.project_id);
+              convIdProjectCache.set(convId, { projectId: dbProjId, at: Date.now() });
+            }
+          } catch (e) {}
+        }
+        if (convId && !dbProjId && sectionProjId) {
+          convIdProjectCache.set(convId, { projectId: sectionProjId, at: Date.now() });
+        }
+
+        const resolvedProjectId = sectionProjId || dbProjId || (convId ? resolveProjectIdFromDb(convId) : "");
+        latestWindowRoute = {
+          projectId: resolvedProjectId || "",
+          convId,
+          sectionProjId,
+          rawUrl,
+          title: pageTarget.title || "",
+          port,
+          updatedAt: Date.now()
+        };
+      }
+    }
+    return latestWindowRoute;
+  })().finally(() => {
+    inflightRoutePromise = null;
+  });
+
+  return inflightRoutePromise;
+}
+
+function getFocusedWindowRoute() {
+  return latestWindowRoute;
+}
+
+// 启动时立即探测一次主窗口路由
+refreshFocusedWindowRoute(true).catch(() => {});
 
 function readJsonSafe(filePath, fallback = {}) {
   try {
@@ -319,6 +472,7 @@ export {
   PROFILES_FILE,
   PROJECTS_DIR,
   APP_STORAGE_FILE,
+  DEVTOOLS_ACTIVE_PORT_FILE,
   CONV_DB_PATH,
   PROTECTED_PLUGINS,
   DEFAULT_KEY,
@@ -326,7 +480,9 @@ export {
   isValidPluginDirectory,
   resolveProjectIdFromDb,
   getLatestActiveProjectIdFromDb,
-  getActiveConversationIdFromStorage,
+  discoverElectronCdpPort,
+  refreshFocusedWindowRoute,
+  getFocusedWindowRoute,
   readJsonSafe,
   getPluginManifest,
   resolvePluginLogoFile,
