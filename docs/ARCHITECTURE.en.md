@@ -67,19 +67,18 @@ plugin-switcher/
 
 ## 2. Four-Tier Project Resolution Algorithm
 
-To reliably determine the active project in complex host environments (multi-root workspaces, chat sessions, cloud desktops, rapid tab switching), the system implements a strict four-tier arbitration hierarchy:
+To reliably determine the active project in complex host environments (multi-root workspaces, chat sessions, cloud desktops, rapid tab switching, and concurrent background Sidecar `iframe` instances), the system implements a four-tier arbitration hierarchy anchored by the host main window's live route:
 
-### Tier 1: Explicit Parameters and O(1) In-Memory Fast Path
-The Sidecar first inspects explicit parameters supplied by the client:
-- Explicit <code>conversationId</code> or <code>projectId</code> (when the frontend already holds a <code>conversationId</code>, it bypasses blocking waits on <code>window.sidecar.getWorkspaceUris()</code>, eliminating timeout stalls on directory-free sessions).
-- <b>O(1) In-Memory Map Priority (<code>convProjectMap</code> + <code>convIdProjectCache</code>)</b>: When <code>conversationId</code> is provided, the backend prioritizes O(1) lookup against <code>profiles.__meta__.convProjectMap[convId]</code> and the in-memory <code>convIdProjectCache</code> (<code>&lt; 1ms</code>), guaranteeing <code>&lt; 15ms</code> instant switching even for remote or directory-free projects.
-- When <code>token</code> is provided, it scans tabs recorded under <code>aux-pane-v2-session</code> inside <code>app_storage.json</code>.
-- If the identified parameter is a valid 36-character UUID belonging to registered projects, the resolution terminates immediately.
+### Tier 1: Electron Main Window Live Route Direct Read (`DevToolsActivePort` Authoritative Source)
+The Sidecar prioritizes reading the currently focused main window route via the standard Chromium DevTools endpoint exposed by the Antigravity host:
+- <b>Dynamic Port Discovery (Zero Hardcoded Ports)</b>: `discoverElectronCdpPort()` in `ls-bridge.mjs` reads the first line of `<AppData>/Antigravity/DevToolsActivePort` (automatically updated by the host whenever a new random port is assigned on startup, with regex extraction of `ws://127.0.0.1:<port>/devtools/browser/` from the tail of `language_server.log` as a secondary fallback).
+- <b>Real-Time Main Window Route Extraction (`< 3ms`)</b>: `refreshFocusedWindowRoute()` queries `http://127.0.0.1:<port>/json`, locates the main window `page` target URL (`https://127.0.0.1:8985/c/<convId>?section=<projectId>`), extracts both the focused `convId` and `sectionProjId`, and seeds the in-memory `convIdProjectCache`.
+- <b>Complete Immunity to Background `iframe` Hijacking and Stale Cache</b>: Because the host main window has exactly one active route at any moment, the backend treats `getFocusedWindowRoute()` as the primary source of truth (`source: "electron-window-route"`), ignores stale `conversationId` polls from non-focused background Sidecar `iframe` tabs, and automatically purges legacy `convProjectMap` entries from `project-plugin-profiles.json`.
 
-### Tier 2: SQLite Query and Multi-Root Path Scoring
-If Tier 1 in-memory lookup misses:
-- <b>Native SQLite Query (Zero Child-Process Blocking)</b>: Leverages the persistent <code>node:sqlite</code> handle to query <code>conversation_summaries.db</code> directly and caches the result in <code>convIdProjectCache</code> (completely skipping external child-process fallbacks whenever <code>node:sqlite</code> is initialized).
-- <b>Longest Common Path Scoring</b>: For new conversations (without a <code>conversationId</code>) where the client reports <code>workspaceUris</code>, the algorithm evaluates each candidate project path.
+### Tier 2: Explicit Parameters, Native SQLite Query, and Multi-Root Path Scoring
+When the main window is in a transitional view without an active conversation route or when triggered independently by lifecycle hooks:
+- <b>Native SQLite Query (Zero Child-Process Blocking)</b>: Leverages the persistent read-only `node:sqlite` handle to query `conversation_summaries.db` directly for `project_id` and caches the result in `convIdProjectCache` (eliminating child-process spawn stalls from Python or `agentapi` CLI).
+- <b>Longest Common Path Scoring</b>: For new conversations (without a `conversationId`) where the client reports `workspaceUris`, the algorithm evaluates each candidate project path.
   - An exact match yields the highest score (10000 points plus path string length).
   - A prefix match yields a score proportional to prefix string length.
   - The project with the highest cumulative score wins, cleanly resolving nested multi-root directories.

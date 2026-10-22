@@ -17,7 +17,8 @@ import {
   recordConfigWriteMeta,
   writeJsonSafe,
   notifyLanguageServer,
-  getLastInternalConfigWriteMs
+  getLastInternalConfigWriteMs,
+  isInternalConfigWriteSettled
 } from "./ls-bridge.mjs";
 
 function scanAntigravityProjects() {
@@ -565,13 +566,15 @@ function getSystemState(query = {}) {
       }
     } else {
       // 分支 B：停留在同一项目内！通过比对 lastAppliedConfigSnapshot 区分「用户在软件原生设置中手动改开关」与「跨项目残留状态」
+      const nowMs = Date.now();
       const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
-      const lastInternalWriteAt = Math.max(
-        getLastInternalConfigWriteMs(),
-        Number(profiles.__meta__.lastInternalConfigWriteAt || 0),
-        lastBgHookAt
-      );
-      if (Date.now() - lastInternalWriteAt > 2500) {
+      const lastProfileWriteAt = Number(profiles.__meta__.lastInternalConfigWriteAt || 0);
+      // 1) 原生 Settings 手动拨动（divergedFromSnapshot === true）：仅需本插件内部 RPC 与写盘静默 450ms 即可秒级放行，彻底告别 2.5s 死等
+      const canSyncNativeToggle = isInternalConfigWriteSettled(450) && (nowMs - lastProfileWriteAt > 450);
+      // 2) 后台其他项目 Hook 瞬态下发残留（divergedFromSnapshot === false）：保持 2500ms 保护窗口后再自愈回写前台项目配置
+      const canRepairBgResidual = canSyncNativeToggle && (nowMs - lastBgHookAt > 2500);
+
+      if (canSyncNativeToggle) {
         const snap = profiles.__meta__.lastAppliedConfigSnapshot || null;
         let profileChanged = false;
         let configRepairNeeded = false;
@@ -586,7 +589,7 @@ function getSystemState(query = {}) {
             if (divergedFromSnapshot) {
               activeProfile.plugins[p.dir] = p.enabled;
               profileChanged = true;
-            } else {
+            } else if (canRepairBgResidual) {
               // config.json 与上次本插件下发的快照相同（说明是后台其他项目的 Hook 下发残留），绝不反向污染当前项目 Profile，并主动自愈修复！
               p.enabled = profileVal;
               if (!config.plugins) config.plugins = {};
@@ -594,6 +597,9 @@ function getSystemState(query = {}) {
               config.plugins[p.dir].enabled = profileVal;
               repairRpcUpdates[p.dir] = { enabled: profileVal };
               configRepairNeeded = true;
+            } else {
+              // 后台 Hook 保护期内，面板内存展示始终锁定为当前前台项目的真实 Profile 状态
+              p.enabled = profileVal;
             }
           }
         }

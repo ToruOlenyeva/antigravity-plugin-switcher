@@ -405,6 +405,8 @@ function resolvePluginLogoUrl(dir, manifest = {}) {
 }
 
 let lastInternalConfigWriteMs = 0;
+let inflightLsRpcCount = 0;
+let lastLsRpcDoneMs = 0;
 
 function extractConfigPluginSnapshot(config) {
   const snap = {};
@@ -445,6 +447,14 @@ function notifyLanguageServer(pluginUpdates) {
 
   try {
     const [hostname, portStr] = lsAddr.split(":");
+    inflightLsRpcCount++;
+    let settled = false;
+    const markSettled = () => {
+      if (settled) return;
+      settled = true;
+      inflightLsRpcCount = Math.max(0, inflightLsRpcCount - 1);
+      lastLsRpcDoneMs = Date.now();
+    };
     const req = http.request({
       hostname,
       port: Number(portStr || 5387),
@@ -455,15 +465,114 @@ function notifyLanguageServer(pluginUpdates) {
         "x-codeium-csrf-token": csrf
       },
       timeout: 1000
-    }, () => {});
-    req.on("error", () => {});
+    }, (res) => {
+      res.resume();
+      res.on("end", markSettled);
+    });
+    req.on("error", markSettled);
+    req.on("timeout", () => {
+      req.destroy();
+      markSettled();
+    });
     req.write(JSON.stringify({ userConfig: { plugins: pluginUpdates } }));
     req.end();
   } catch (e) {}
 }
 
 export function getLastInternalConfigWriteMs() {
-  return lastInternalConfigWriteMs;
+  return Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs);
+}
+
+export function isInternalConfigWriteSettled(minSettleMs = 450) {
+  if (inflightLsRpcCount > 0) return false;
+  return (Date.now() - Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs)) > minSettleMs;
+}
+
+export function syncNativeSettingsFromLsMemory() {
+  const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "";
+  const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
+  if (!lsAddr || !csrf || !isInternalConfigWriteSettled(450)) {
+    return Promise.resolve(false);
+  }
+
+  return new Promise((resolve) => {
+    try {
+      const [hostname, portStr] = lsAddr.split(":");
+      const req = http.request({
+        hostname,
+        port: Number(portStr || 5387),
+        path: "/exa.language_server_pb.LanguageServerService/GetAllPlugins",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-codeium-csrf-token": csrf
+        },
+        timeout: 450
+      }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return resolve(false);
+        }
+        let body = "";
+        res.setEncoding("utf-8");
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => {
+          try {
+            if (!isInternalConfigWriteSettled(450)) return resolve(false);
+            const data = JSON.parse(body);
+            const list = data?.plugins || data?.pluginInfos || data?.items || [];
+            if (!Array.isArray(list) || list.length === 0) return resolve(false);
+
+            const profiles = readJsonSafe(PROFILES_FILE, {});
+            const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
+            if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return resolve(false);
+            const lastProfileWriteAt = Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0);
+            if (Date.now() - lastProfileWriteAt <= 450) return resolve(false);
+
+            const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
+            const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
+            if (!config.plugins) config.plugins = {};
+            const activeProfile = profiles[lastActiveId];
+            let changed = false;
+
+            for (const item of list) {
+              const rawKey = item?.id || item?.name || item?.pluginId || item?.directory || "";
+              const dir = String(rawKey).split("@")[0].trim();
+              if (!dir || PROTECTED_PLUGINS.has(dir) || !isValidPluginDirectory(dir)) continue;
+              if (typeof item?.enabled !== "boolean") continue;
+              const enabledInLs = item.enabled;
+              const divergedFromSnapshot = !snap || snap[dir] === undefined || Boolean(snap[dir]) !== enabledInLs;
+              if (divergedFromSnapshot && activeProfile.plugins[dir] !== enabledInLs) {
+                activeProfile.plugins[dir] = enabledInLs;
+                if (!config.plugins[dir]) config.plugins[dir] = {};
+                config.plugins[dir].enabled = enabledInLs;
+                changed = true;
+              }
+            }
+
+            if (changed) {
+              writeJsonSafe(CONFIG_FILE, config);
+              recordConfigWriteMeta(profiles, config);
+              writeJsonSafe(PROFILES_FILE, profiles);
+              return resolve(true);
+            }
+            resolve(false);
+          } catch (err) {
+            resolve(false);
+          }
+        });
+      });
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.on("error", () => resolve(false));
+      req.write("{}");
+      req.end();
+    } catch (e) {
+      resolve(false);
+    }
+  });
 }
 
 export {

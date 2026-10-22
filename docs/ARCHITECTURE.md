@@ -67,19 +67,18 @@ plugin-switcher/
 
 ## 2. 四级项目裁决优先级算法
 
-为了在复杂的宿主环境（多工作区、纯聊天会话、GCP 远程桌面、快速切标签页）中准确定位当前项目，系统实现了严密的四级裁决算法：
+为了在复杂的宿主环境（多工作区、纯聊天会话、GCP 远程桌面、快速切标签页、多窗口后台 Sidecar `iframe` 并存）中准确定位当前项目，系统实现了以宿主主窗口实时路由为唯一权威真相源的四级裁决算法：
 
-### 级别 1：显式参数与 O(1) 内存映射极速快路
-Sidecar 优先提取客户端请求中携带的显式参数：
-- 显式 <code>conversationId</code> 或 <code>projectId</code>（当前端已持有 <code>conversationId</code> 时，直接免除 <code>window.sidecar.getWorkspaceUris()</code> 的跨进程阻塞等待，避免无本地路径会话产生超时停顿）。
-- <b>O(1) 内存映射查表优先（<code>convProjectMap</code> + <code>convIdProjectCache</code>）</b>：携带 <code>conversationId</code> 时，后端优先从内存映射表 <code>profiles.__meta__.convProjectMap[convId]</code> 与进程级缓存 <code>convIdProjectCache</code> 中直接命中目标项目 ID（耗时 <code>&lt; 1ms</code>），确保远程或无本地文件夹项目（如 <code>antigravity-relay</code>、纯对话项目等）同样实现 <code>&lt; 15ms</code> 丝滑秒切。
-- 携带 <code>token</code> 时，扫描 <code>app_storage.json</code> 中 <code>aux-pane-v2-session</code> 对应的会话 Tab。
-- 若参数为有效的 36 位 UUID 且存在于已知项目列表中，直接完成裁决。
+### 级别 1：Electron 主窗口动态路由直读（`DevToolsActivePort` 唯一权威真相源）
+Sidecar 优先通过 Antigravity 宿主暴露的标准 Chromium 调试接口直读当前焦点主窗口路由：
+- <b>动态端口发现（零硬编码端口）</b>：`ls-bridge.mjs` 中的 `discoverElectronCdpPort()` 优先读取 `<AppData>/Antigravity/DevToolsActivePort` 首行记录的动态调试端口（客户端每次重启分配新随机端口时均自动刷新该文件，并以 `language_server.log` 尾部 `ws://127.0.0.1:<port>/devtools/browser/` 正则匹配作为次级兜底）。
+- <b>主窗口路由实时提取（`< 3ms`）</b>：`refreshFocusedWindowRoute()` 请求 `http://127.0.0.1:<port>/json`，定位主窗口 `page` Target 的实时路由 URL（`https://127.0.0.1:8985/c/<convId>?section=<projectId>`），直接提取当前焦点会话 `convId` 与所属项目 `sectionProjId`，并同步写入进程级缓存 `convIdProjectCache`。
+- <b>彻底免疫后台失焦 `iframe` 轮询劫持与历史脏缓存</b>：由于宿主主窗口任意时刻只有一个激活路由，后端以 `getFocusedWindowRoute()` 为最高优先级裁决源（`source: "electron-window-route"`），忽略未销毁的后台会话 `iframe` 轮询参数，并自动清理 `project-plugin-profiles.json` 中历史残留的 `convProjectMap` 脏映射。
 
-### 级别 2：SQLite 直查与多工作区路径打分
-若级别 1 内存映射未命中：
-- <b>原生 SQLite 毫秒级直查（零子进程阻塞）</b>：利用 <code>node:sqlite</code> 常驻句柄直连 <code>conversation_summaries.db</code> 检索当前会话的项目绑定并写入 <code>convIdProjectCache</code>（当 <code>node:sqlite</code> 可用时彻底跳过外部子进程回退）。
-- <b>最长公共路径打分协同</b>：当新建对话（无 <code>conversationId</code>）且客户端上报 <code>workspaceUris</code> 时，遍历所有已知项目的物理路径。
+### 级别 2：显式参数、SQLite 毫秒级直查与多工作区路径打分
+当主窗口处于未打开具体会话的过渡态或由生命周期 Hook 独立触发时：
+- <b>原生 SQLite 毫秒级直查（零子进程阻塞）</b>：利用 `node:sqlite` 常驻只读句柄直连 `conversation_summaries.db` 检索 `conversationId` 对应的 `project_id` 并写入 `convIdProjectCache`（彻底免除拉起外部 Python 或 `agentapi` 子进程的阻塞停顿）。
+- <b>最长公共路径打分协同</b>：当新建对话（无 `conversationId`）且客户端上报 `workspaceUris` 时，遍历所有已知项目的物理路径。
   - 完全一致路径赋予最高权重（10000 分加路径字符长度）。
   - 前缀匹配子路径赋予前缀长度权重。
   - 得分最高者胜出，完美支持多目录工作区与单项目嵌套。

@@ -20,7 +20,9 @@ import {
   recordConfigWriteMeta,
   writeJsonSafe,
   notifyLanguageServer,
-  getLastInternalConfigWriteMs
+  getLastInternalConfigWriteMs,
+  isInternalConfigWriteSettled,
+  syncNativeSettingsFromLsMemory
 } from "./ls-bridge.mjs";
 import {
   scanAntigravityProjects,
@@ -908,59 +910,89 @@ function bindAdditionalSidecarPorts() {
 bindAdditionalSidecarPorts();
 setInterval(bindAdditionalSidecarPorts, 5000);
 
-// 常驻 800ms 监听 Antigravity Electron 主窗口路由跃变：哪怕内置 Sidecar 面板完全关闭，切项目或切会话也会在 0.8s 内自动切换配置并通过 SSE 推送给 8088 与所有活跃面板
+// 常驻 800ms 监听 Antigravity Electron 主窗口路由跃变与 LS 内存态原生设置变更：哪怕内置 Sidecar 面板完全关闭，切项目或改原生设置也会在亚秒级自动同步并通过 SSE 推送给 8088 与所有活跃面板
 let lastObservedRouteSig = "";
 setInterval(async () => {
   try {
+    const lsSynced = await syncNativeSettingsFromLsMemory();
     const route = await refreshFocusedWindowRoute(true);
-    if (!route || !route.projectId) return;
+    if (!route || !route.projectId) {
+      if (lsSynced) {
+        const stateData = getSystemState({ isPassive: false });
+        broadcastStateToAllFrontends(stateData, true);
+      }
+      return;
+    }
     const sig = `${route.projectId}|${route.convId || ""}`;
-    if (sig !== lastObservedRouteSig) {
+    if (sig !== lastObservedRouteSig || lsSynced) {
       lastObservedRouteSig = sig;
       const stateData = getSystemState({ isPassive: false });
-      broadcastStateToAllFrontends(stateData);
+      broadcastStateToAllFrontends(stateData, Boolean(lsSynced));
     }
   } catch (e) {}
 }, 800);
 
-// 后台监听 config.json 物理变更：仅当 config.json 相比本插件最后一次下发的快照（lastAppliedConfigSnapshot）发生真实偏离时，才认定为用户在原生 Settings 中手动拨动了开关
+// 事件驱动监听 config.json 物理变更（fs.watch 毫秒级内核事件 + fs.watchFile 兜底）：
+// 当用户在 Antigravity 原生 Settings 中拨动开关时，无需等待 2.5s 轮询，在 <150ms 内立即捕获并经由 SSE 0ms 广播至内置 Sidecar 与 8088 面板
+function handleExternalConfigFileChange() {
+  if (!isInternalConfigWriteSettled(450)) return;
+  try {
+    const profiles = readJsonSafe(PROFILES_FILE, {});
+    const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
+    if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return;
+
+    const lastProfileWriteAt = Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0);
+    if (Date.now() - lastProfileWriteAt <= 450) return;
+
+    const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
+    const activeProfile = profiles[lastActiveId];
+    const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
+    let changed = false;
+
+    for (const [pluginDir, pluginCfg] of Object.entries(config.plugins || {})) {
+      if (PROTECTED_PLUGINS.has(pluginDir)) continue;
+      const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
+      const divergedFromSnapshot = !snap || snap[pluginDir] === undefined || Boolean(snap[pluginDir]) !== enabledInConfig;
+      if (divergedFromSnapshot && activeProfile.plugins[pluginDir] !== enabledInConfig) {
+        activeProfile.plugins[pluginDir] = enabledInConfig;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      recordConfigWriteMeta(profiles, config);
+      writeJsonSafe(PROFILES_FILE, profiles);
+      console.log(`[PluginSwitcher Sidecar] Instant native Settings sync -> project ${lastActiveId}`);
+      const stateData = getSystemState({ isPassive: false });
+      broadcastStateToAllFrontends(stateData, true);
+    }
+  } catch (e) {}
+}
+
+let configWatchDebounceTimer = null;
+function triggerConfigWatchDebounced() {
+  if (configWatchDebounceTimer) clearTimeout(configWatchDebounceTimer);
+  configWatchDebounceTimer = setTimeout(() => {
+    configWatchDebounceTimer = null;
+    handleExternalConfigFileChange();
+  }, 80);
+}
+
+try {
+  const configDir = path.dirname(CONFIG_FILE);
+  if (fs.existsSync(configDir)) {
+    fs.watch(configDir, { persistent: false }, (eventType, filename) => {
+      if (!filename || filename === "config.json") {
+        triggerConfigWatchDebounced();
+      }
+    });
+  }
+} catch (e) {}
+
 try {
   fs.watchFile(CONFIG_FILE, { interval: 1000 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return;
-    if (Date.now() - getLastInternalConfigWriteMs() < 2500) return;
-    try {
-      const profiles = readJsonSafe(PROFILES_FILE, {});
-      const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
-      if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return;
-
-      const lastWriteAt = Math.max(
-        getLastInternalConfigWriteMs(),
-        Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0),
-        Number(profiles?.__meta__?.lastBgHookAt || 0)
-      );
-      if (Date.now() - lastWriteAt < 2500) return;
-
-      const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
-      const activeProfile = profiles[lastActiveId];
-      const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
-      let changed = false;
-
-      for (const [pluginDir, pluginCfg] of Object.entries(config.plugins || {})) {
-        if (PROTECTED_PLUGINS.has(pluginDir)) continue;
-        const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
-        const divergedFromSnapshot = !snap || snap[pluginDir] === undefined || Boolean(snap[pluginDir]) !== enabledInConfig;
-        if (divergedFromSnapshot && activeProfile.plugins[pluginDir] !== enabledInConfig) {
-          activeProfile.plugins[pluginDir] = enabledInConfig;
-          changed = true;
-        }
-      }
-
-      if (changed) {
-        recordConfigWriteMeta(profiles, config);
-        writeJsonSafe(PROFILES_FILE, profiles);
-        console.log(`[PluginSwitcher Sidecar] Headless sync: native Settings changes saved to project ${lastActiveId}`);
-      }
-    } catch (e) {}
+    triggerConfigWatchDebounced();
   });
 } catch (e) {}
 
