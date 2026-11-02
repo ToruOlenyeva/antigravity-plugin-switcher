@@ -1232,35 +1232,73 @@
         // 即时渲染卡片
         onSelectProject();
 
-        // 挂载 SSE 实时双输出监听（后端基于主窗口实时路由算出的同一份 stateData 0ms 同步推送到内置 Sidecar 与 8088 独立页面）
-        if (!window.__sseSource && typeof window.EventSource === "function") {
-          try {
-            const es = new EventSource("/api/events");
-            es.onmessage = (ev) => {
-              if (!isPanelActuallyVisible()) return;
-              try {
-                const pushedState = JSON.parse(ev.data);
-                applyIncomingStateData(pushedState);
-              } catch (e) {}
-            };
-            window.__sseSource = es;
-          } catch (e) {}
+        // 按需管理 SSE 实时连接：仅当面板真实可见时才维持 /api/events 连接；面板折叠或隐藏时立即断开，让后端 sseClients.size 归零进入 0% CPU 深度休眠
+        function ensureSseConnected() {
+          if (!isPanelActuallyVisible()) return;
+          if (!window.__sseSource && typeof window.EventSource === "function") {
+            try {
+              const es = new EventSource("/api/events");
+              es.onmessage = (ev) => {
+                if (!isPanelActuallyVisible()) return;
+                try {
+                  const pushedState = JSON.parse(ev.data);
+                  applyIncomingStateData(pushedState);
+                } catch (e) {}
+              };
+              window.__sseSource = es;
+            } catch (e) {}
+          }
+        }
+
+        function closeSseConnection() {
+          if (window.__sseSource) {
+            try {
+              window.__sseSource.close();
+            } catch (e) {}
+            window.__sseSource = null;
+          }
+        }
+
+        if (isPanelActuallyVisible()) {
+          ensureSseConnected();
+        } else {
+          closeSseConnection();
         }
 
         // 挂载事件监听器与轻量安全心跳（跃变门禁守门：真切项目瞬间联动，编辑其他项目绝对不打断）
         if (!window.__listenersBound) {
           window.__listenersBound = true;
-          window.addEventListener("focus", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
-          document.addEventListener("visibilitychange", handleVisibilityChange);
-          document.addEventListener("pointerenter", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
-          document.addEventListener("pointerdown", () => syncActiveProjectSilently("", "", !isEmbeddedSidecar));
+          window.addEventListener("focus", () => {
+            ensureSseConnected();
+            syncActiveProjectSilently("", "", !isEmbeddedSidecar);
+          });
+          document.addEventListener("visibilitychange", () => {
+            if (isPanelActuallyVisible()) {
+              ensureSseConnected();
+              handleVisibilityChange();
+            } else {
+              closeSseConnection();
+            }
+          });
+          document.addEventListener("pointerenter", () => {
+            ensureSseConnected();
+            syncActiveProjectSilently("", "", !isEmbeddedSidecar);
+          });
+          document.addEventListener("pointerdown", () => {
+            ensureSseConnected();
+            syncActiveProjectSilently("", "", !isEmbeddedSidecar);
+          });
 
           let wasPanelVisible = isPanelActuallyVisible();
           const checkVisibilityTransition = () => {
             const isNowVisible = isPanelActuallyVisible();
             if (isNowVisible && !wasPanelVisible) {
               wasPanelVisible = true;
+              ensureSseConnected();
               syncActiveProjectSilently("", currentActiveWorkspaceUris.join("|"), !isEmbeddedSidecar);
+            } else if (!isNowVisible && wasPanelVisible) {
+              wasPanelVisible = false;
+              closeSseConnection();
             } else {
               wasPanelVisible = isNowVisible;
             }

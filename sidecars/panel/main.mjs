@@ -927,12 +927,14 @@ setInterval(async () => {
 }, 3500);
 
 // 事件驱动监听 config.json 物理变更（fs.watch 毫秒级内核事件 + fs.watchFile 兜底）：
-// 当用户在 Antigravity 原生 Settings 中拨动开关时，无需等待 2.5s 轮询，在 <150ms 内立即捕获并经由 SSE 0ms 广播至内置 Sidecar 与 8088 面板
-function handleExternalConfigFileChange() {
+// 当用户在 Antigravity 原生 Settings 中拨动开关时，无需等待轮询，在 <150ms 内立即捕获并经由 SSE 0ms 广播至内置 Sidecar 与 8088 面板
+async function handleExternalConfigFileChange() {
   if (!isInternalConfigWriteSettled(600)) return;
   try {
+    const route = await refreshFocusedWindowRoute(true);
     const profiles = readJsonSafe(PROFILES_FILE, {});
-    const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
+    const routeProjectId = (route && route.projectId && profiles[route.projectId]) ? route.projectId : "";
+    const lastActiveId = routeProjectId || profiles?.__meta__?.lastActiveProjectId || "";
     if (!lastActiveId || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return;
 
     const nowMs = Date.now();
@@ -941,8 +943,13 @@ function handleExternalConfigFileChange() {
     const lastBgHookAt = Number(profiles?.__meta__?.lastBgHookAt || 0);
     if (nowMs - lastProfileWriteAt <= 800 || nowMs - lastSwitchAt <= 1500 || nowMs - lastBgHookAt <= 1500) return;
 
-    const route = getFocusedWindowRoute();
-    if (route && route.projectId && route.projectId !== lastActiveId) return;
+    // 若用户未打开右侧面板（sseClients.size === 0）且刚在左侧切换到新项目后直接去改原生 Settings，先切档对齐新项目，严禁将旧项目快照变化串写到新项目或旧项目
+    if (routeProjectId && profiles?.__meta__?.lastActiveProjectId && routeProjectId !== profiles.__meta__.lastActiveProjectId) {
+      const stateData = getSystemState({ clientProjectId: routeProjectId, isPassive: false });
+      broadcastStateToAllFrontends(stateData, true);
+      return;
+    }
+
     if (profiles?.__meta__?.lastAppliedProjectId && profiles.__meta__.lastAppliedProjectId !== lastActiveId) return;
 
     const config = readJsonSafe(CONFIG_FILE, { plugins: {} });

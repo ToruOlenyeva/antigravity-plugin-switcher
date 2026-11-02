@@ -70,7 +70,7 @@ plugin-switcher/
 为了在复杂的宿主环境（多工作区、纯聊天会话、GCP 远程桌面、快速切标签页、多窗口后台 Sidecar `iframe` 并存）中准确定位当前项目，系统实现了以宿主主窗口实时路由为唯一权威真相源的四级裁决算法：
 
 ### 级别 1：Electron 主窗口动态路由直读（`DevToolsActivePort` 唯一权威真相源）
-Sidecar 优先通过 Antigravity 宿主暴露的标准 Chromium 调试接口直读当前焦点主窗口路由：
+由于用户在 Antigravity 左侧点击切换项目或历史对话时，宿主<b>仅在 Electron 纯内存中更新前端路由而不修改磁盘上的 `app_storage.json` 或 `conversation_summaries.db`</b>（直至用户真正发出新消息才落盘），严禁依赖监听磁盘文件判断窗口切换；Sidecar 优先通过宿主暴露的标准 Chromium 调试接口直读当前焦点主窗口内存路由：
 - <b>动态端口发现（零硬编码端口）</b>：`ls-bridge.mjs` 中的 `discoverElectronCdpPort()` 优先读取 `<AppData>/Antigravity/DevToolsActivePort` 首行记录的动态调试端口（客户端每次重启分配新随机端口时均自动刷新该文件，并以 `language_server.log` 尾部 `ws://127.0.0.1:<port>/devtools/browser/` 正则匹配作为次级兜底）。
 - <b>主窗口路由实时提取（`< 3ms`）</b>：`refreshFocusedWindowRoute()` 请求 `http://127.0.0.1:<port>/json`，定位主窗口 `page` Target 的实时路由 URL（`https://127.0.0.1:8985/c/<convId>?section=<projectId>`），直接提取当前焦点会话 `convId` 与所属项目 `sectionProjId`，并同步写入进程级缓存 `convIdProjectCache`。
 - <b>彻底免疫后台失焦 `iframe` 轮询劫持与历史脏缓存</b>：由于宿主主窗口任意时刻只有一个激活路由，后端以 `getFocusedWindowRoute()` 为最高优先级裁决源（`source: "electron-window-route"`），忽略未销毁的后台会话 `iframe` 轮询参数，并自动清理 `project-plugin-profiles.json` 中历史残留的 `convProjectMap` 脏映射。
@@ -104,7 +104,7 @@ Sidecar 优先通过 Antigravity 宿主暴露的标准 Chromium 调试接口直�
 3. <b>防线 3：全模式后台隔离、先锁 Profiles 后写 Config 顺序锁与三方基线对账（<code>lastAppliedConfigSnapshot</code> + <code>lsRpcTarget</code>）</b>
    - 当 Sidecar 面板在前台活跃追踪项目 B（<code>isSidecarActivelyTrackingOtherProject</code> <code>&lt; 8s</code>）时，后台项目 A 的 <code>pre-tool</code> 与 <code>pre-invocation</code> 钩子（含未携带 <code>conversationId</code> 的通用工具调用）全量静默退避，严禁覆写共享 <code>config.json</code>；同时 Sidecar 将 Language Server 动态连接凭据缓存于 <code>__meta__.lsRpcTarget</code>，供无环境变量的钩子子进程跨进程同步调用 <code>JetboxWriteState</code>。
    - 任何进程更新 <code>config.json</code> 前，必须<b>先落盘 <code>project-plugin-profiles.json</code></b>（提前锁死 <code>lastInternalConfigWriteAt</code>、<code>lastProjectSwitchAt</code>、<code>lastAppliedProjectId</code> 与 <code>lastAppliedConfigSnapshot</code>），再写入 <code>config.json</code>，从物理时序上消灭 <code>fs.watch</code> 异步监听读到旧快照的抢跑窗口。
-   - 当用户在 Antigravity 原生 Settings 界面手动拨动插件开关时，<code>main.mjs</code> 的零轮询 <code>fs.watch(CONFIG_DIR)</code> 监听器与 Language Server 内存态直读接口 <code>GetAllPlugins</code>（解析 <code>item.userConfig.enabled</code>）仅在路由确认未发生切窗、<code>lastAppliedProjectId === lastActiveId</code>、渡过 <code>2000ms</code> 切窗冷却锁且满足「快照 === 磁盘 === 档案」三方基线一致（<code>snap[dir] === configVal === profileVal</code>）时，才在 <code>&lt; 150ms</code> 内将原生改动沉淀入当前活跃项目档案并通过 SSE <code>0ms</code> 推送全端面板翻转。
+   - 当用户在 Antigravity 原生 Settings 界面手动拨动插件开关时（严禁后台定时轮询 `GetAllPlugins` RPC 造成 CPU 与电源高占用），<code>main.mjs</code> 的零轮询 <code>fs.watch(CONFIG_DIR)</code> 内核监听器会先调用 <code>await refreshFocusedWindowRoute(true)</code> 实时确认当前 Electron 内存焦点项目（若在无面板状态下刚发生跨项目切换则先对齐新项目），并在满足 <code>lastAppliedProjectId === lastActiveId</code>、渡过 <code>1500ms</code> 切窗冷却锁及快照偏离校验时，在 <code>&lt; 150ms</code> 内将原生改动沉淀入当前活跃项目档案并通过 SSE <code>0ms</code> 推送全端面板翻转。
 4. <b>防线 4：原子写盘（<code>.tmp</code> + <code>renameSync</code>）、<code>.bak</code> 热备与全量重置硬熔断（防并发截断覆盖）</b>
    - <b>消灭非原子截断竞态</b>：<code>ls-bridge.mjs</code> 与 <code>auto-switch.cjs</code> 对 <code>project-plugin-profiles.json</code> 及 <code>config.json</code> 统一采用同目录临时文件 <code>.tmp.${pid}</code> 写入加 <code>fs.renameSync</code> 原子替换，并在确认结构完整后同步备份至 <code>project-plugin-profiles.json.bak</code>。
    - <b>三级容错读取与写盘熔断</b>：<code>readJsonSafe</code> / <code>readJsonRobust</code> 内置 3 次瞬态重试、进程内 <code>lastValidJsonCache</code> 缓存与 <code>.bak</code> 自动回退，确保已存在的配置档案绝不因并发读取返回空对象 <code>{}</code>；同时在 <code>getSystemState()</code> 与 <code>writeJsonSafe()</code> 设立全量重置熔断器（<code>allowProfilesDiskWrite</code>），一旦检测到已有配置档案缺失 <code>__default__</code> 或 UUID 项目数骤降为 0，立即拒绝写盘，彻底根绝当前活跃项目配置意外覆盖默认配置与全量独立档案。
@@ -125,8 +125,8 @@ Sidecar 优先通过 Antigravity 宿主暴露的标准 Chromium 调试接口直�
 - <b>后端计算一次、<code>latestDualOutputState</code> + SSE（<code>GET /api/events</code>）零延迟双份输出</b>：
   - 每当内置 Sidecar 请求 <code>GET /api/status</code> 计算出最新 <code>stateData</code> 时，后端立即将其缓存至内存 <code>latestDualOutputState</code>，并通过 <code>broadcastStateToAllFrontends(stateData)</code> 经由 <code>GET /api/events</code> (Server-Sent Events) <code>0ms</code> 实时推送给外部浏览器 <code>http://localhost:8088</code>；
   - 外部浏览器 <code>http://localhost:8088</code> 通过 <code>new EventSource("/api/events")</code> 实时接收内置 Sidecar 的同一份状态数据包并立即更新 DOM，同时其常规 <code>GET /api/status</code> 请求直接复用 <code>latestDualOutputState.activeProjectId</code>（仅在内置 Sidecar 超过 <code>8s</code> 未轮询即面板关闭时，才回退使用 <code>app_storage.json</code> 置顶会话兜底），彻底杜绝独立猜状态导致的滞后与错位。
-- <b>前端双观察者可见性感知（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
-  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver({ trackVisibility: true, delay: 100 })</code> 实时检测视口遮挡与真实可见性：当旧对话 Sidecar iframe 退入后台被遮挡或折叠时，立即冻结其 <code>2.5s</code> 定时轮询；当用户切回该对话使面板重新可见时，立即触发一次主动同步（<code>isPassive = false</code>），瞬间驱动内置面板与 <code>8088</code> 同步翻转。
+- <b>前端双观察者可见性感知与折叠态 SSE 断连 0% CPU 休眠（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
+  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver</code> 实时检测视口遮挡与真实可见性：当右侧面板被折叠收起、切至其他辅助栏标签页或旧对话 Sidecar iframe 退入后台不可见时，前端立即冻结 <code>2.5s</code> 定时轮询并主动调用 <code>close()</code> 断开 <code>EventSource("/api/events")</code> 连接，使后端 <code>sseClients.size</code> 归零进入 <code>0% CPU</code> 深度休眠；当面板重新展开可见时，立即重连 SSE 并触发一次主动同步（<code>isPassive = false</code>），瞬间驱动内置面板与 <code>8088</code> 同步翻转。
 
 ## 4. HTTP API 接口规范
 
