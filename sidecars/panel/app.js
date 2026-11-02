@@ -333,6 +333,23 @@
       const left = document.createElement("div");
       left.className = "dropdown-option-left";
 
+      const dotSlot = document.createElement("span");
+      dotSlot.className = "dropdown-dot-slot";
+      if (isHostActive) {
+        const dot = document.createElement("span");
+        dot.className = "dropdown-active-dot";
+        dot.title = currentLang === "zh" ? "当前活跃项目" : "Current Active Project";
+        dotSlot.appendChild(dot);
+      }
+
+      const span = document.createElement("span");
+      span.className = "dropdown-option-label";
+      span.textContent = labelText;
+
+      left.appendChild(dotSlot);
+      left.appendChild(span);
+      opt.appendChild(left);
+
       const checkSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       checkSvg.setAttribute("class", "dropdown-check-icon");
       checkSvg.setAttribute("viewBox", "0 0 20 20");
@@ -344,21 +361,7 @@
       const poly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
       poly.setAttribute("points", "4 10 8 14 16 6");
       checkSvg.appendChild(poly);
-
-      const span = document.createElement("span");
-      span.className = "dropdown-option-label";
-      span.textContent = labelText;
-
-      left.appendChild(checkSvg);
-      left.appendChild(span);
-      opt.appendChild(left);
-
-      if (isHostActive) {
-        const dot = document.createElement("span");
-        dot.className = "dropdown-active-dot";
-        dot.title = currentLang === "zh" ? "当前活跃项目" : "Current Active Project";
-        opt.appendChild(dot);
-      }
+      opt.appendChild(checkSvg);
 
       return opt;
     }
@@ -384,6 +387,9 @@
       const left = document.createElement("div");
       left.className = "dropdown-option-left";
 
+      const dotSlot = document.createElement("span");
+      dotSlot.className = "dropdown-dot-slot";
+
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.className = "dropdown-checkbox";
@@ -394,6 +400,7 @@
       span.className = "dropdown-option-label";
       span.textContent = t.batchSelectAll;
 
+      left.appendChild(dotSlot);
       left.appendChild(cb);
       left.appendChild(span);
       opt.appendChild(left);
@@ -423,6 +430,15 @@
       const left = document.createElement("div");
       left.className = "dropdown-option-left";
 
+      const dotSlot = document.createElement("span");
+      dotSlot.className = "dropdown-dot-slot";
+      if (isHostActive) {
+        const dot = document.createElement("span");
+        dot.className = "dropdown-active-dot";
+        dot.title = currentLang === "zh" ? "当前活跃项目" : "Current Active Project";
+        dotSlot.appendChild(dot);
+      }
+
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.className = "dropdown-checkbox";
@@ -432,16 +448,10 @@
       span.className = "dropdown-option-label";
       span.textContent = proj.name;
 
+      left.appendChild(dotSlot);
       left.appendChild(cb);
       left.appendChild(span);
       opt.appendChild(left);
-
-      if (isHostActive) {
-        const dot = document.createElement("span");
-        dot.className = "dropdown-active-dot";
-        dot.title = currentLang === "zh" ? "当前活跃项目" : "Current Active Project";
-        opt.appendChild(dot);
-      }
 
       return opt;
     }
@@ -494,17 +504,17 @@
         }
       }
       labelEl.innerHTML = "";
+      if (isCurrentActive) {
+        const dot = document.createElement("span");
+        dot.className = "dropdown-active-dot";
+        labelEl.appendChild(dot);
+      }
       const textNode = document.createElement("span");
       textNode.style.overflow = "hidden";
       textNode.style.textOverflow = "ellipsis";
       textNode.style.whiteSpace = "nowrap";
       textNode.textContent = currentLabel;
       labelEl.appendChild(textNode);
-      if (isCurrentActive) {
-        const dot = document.createElement("span");
-        dot.className = "dropdown-active-dot";
-        labelEl.appendChild(dot);
-      }
 
       // 构建常规单选下拉菜单项
       menu.innerHTML = "";

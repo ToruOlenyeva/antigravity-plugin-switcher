@@ -263,6 +263,14 @@
       min-width: 0;
       flex: 1;
     }
+    .dropdown-dot-slot {
+      width: 10px;
+      height: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
     .dropdown-check-icon {
       width: 13px;
       height: 13px;

@@ -908,35 +908,23 @@ function bindAdditionalSidecarPorts() {
 }
 
 bindAdditionalSidecarPorts();
-setInterval(bindAdditionalSidecarPorts, 5000);
+setTimeout(bindAdditionalSidecarPorts, 4000);
 
-// 常驻 800ms 监听 Antigravity Electron 主窗口路由跃变与 LS 内存态原生设置变更：哪怕内置 Sidecar 面板完全关闭，切项目或改原生设置也会在亚秒级自动同步并通过 SSE 推送给 8088 与所有活跃面板
+// 仅当存在活跃前端面板连接（sseClients.size > 0）时低频（3500ms）检测窗口路由跃变；面板关闭时完全休眠（0% CPU 占用），原生设置变更由下方 fs.watch 内核事件实时驱动
 let lastObservedRouteSig = "";
 setInterval(async () => {
+  if (sseClients.size === 0) return;
   try {
     const route = await refreshFocusedWindowRoute(true);
-    if (!route || !route.projectId) {
-      const lsSynced = await syncNativeSettingsFromLsMemory("");
-      if (lsSynced) {
-        const stateData = getSystemState({ isPassive: false });
-        broadcastStateToAllFrontends(stateData, true);
-      }
-      return;
-    }
+    if (!route || !route.projectId) return;
     const sig = `${route.projectId}|${route.convId || ""}`;
     if (sig !== lastObservedRouteSig) {
       lastObservedRouteSig = sig;
       const stateData = getSystemState({ isPassive: false });
       broadcastStateToAllFrontends(stateData, false);
-      return;
-    }
-    const lsSynced = await syncNativeSettingsFromLsMemory(route.projectId);
-    if (lsSynced) {
-      const stateData = getSystemState({ isPassive: false });
-      broadcastStateToAllFrontends(stateData, true);
     }
   } catch (e) {}
-}, 800);
+}, 3500);
 
 // 事件驱动监听 config.json 物理变更（fs.watch 毫秒级内核事件 + fs.watchFile 兜底）：
 // 当用户在 Antigravity 原生 Settings 中拨动开关时，无需等待 2.5s 轮询，在 <150ms 内立即捕获并经由 SSE 0ms 广播至内置 Sidecar 与 8088 面板

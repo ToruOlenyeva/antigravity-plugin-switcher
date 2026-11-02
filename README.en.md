@@ -109,8 +109,8 @@ plugin-switcher/
 
 ### 1. Workspace Profile Customization
 Open the Project Plugin Switcher tab in the right Auxiliary Pane:
-- The <b>green dot</b> on the right indicates the active project currently running in the host.
-- The <b>blue checkmark</b> on the left indicates the profile currently being viewed and modified.
+- The <b>green dot</b> on the left indicates the active project currently running in the host.
+- The <b>blue checkmark</b> on the right indicates the profile currently being viewed and modified.
 - Toggle any plugin card switch to apply changes immediately and notify the host language server.
 
 ### 2. Global Default Profile
