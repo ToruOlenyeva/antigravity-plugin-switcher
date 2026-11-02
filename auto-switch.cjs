@@ -7,6 +7,7 @@ const os = require("os");
 const homeDir = os.homedir();
 const appDataDir = process.env.APPDATA || (process.platform === "darwin" ? path.join(homeDir, "Library", "Application Support") : path.join(homeDir, ".config"));
 const APP_STORAGE_FILE = path.join(appDataDir, "Antigravity", "app_storage.json");
+const DEVTOOLS_ACTIVE_PORT_FILE = path.join(appDataDir, "Antigravity", "DevToolsActivePort");
 const CONV_DB_PATH = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
 const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
 const profilesBakPath = `${profilesPath}.bak`;
@@ -178,6 +179,61 @@ function resolveProjectIdByConvId(convId, convDbPath) {
     if (pId) return pId;
   } catch (e) {}
   return "";
+}
+
+function getFocusedWindowRouteCdp(convDbPath, profilesMeta) {
+  return new Promise((resolve) => {
+    try {
+      if (!fs.existsSync(DEVTOOLS_ACTIVE_PORT_FILE)) return resolve(null);
+      const raw = fs.readFileSync(DEVTOOLS_ACTIVE_PORT_FILE, "utf-8");
+      const port = Number((raw.split(/\r?\n/)[0] || "").trim());
+      if (!(port > 1024 && port < 65535)) return resolve(null);
+
+      const req = http.get({
+        hostname: "127.0.0.1",
+        port,
+        path: "/json",
+        timeout: 220
+      }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return resolve(null);
+        }
+        let body = "";
+        res.setEncoding("utf-8");
+        res.on("data", (c) => { body += c; });
+        res.on("end", () => {
+          try {
+            const targets = JSON.parse(body);
+            if (!Array.isArray(targets)) return resolve(null);
+            const page = targets.find((t) =>
+              t && t.type === "page" && typeof t.url === "string" &&
+              (t.url.includes("/c/") || t.url.includes("section=") || (t.title || "").includes("Antigravity"))
+            );
+            if (!page || !page.url) return resolve(null);
+            const convMatch = page.url.match(/\/c\/([0-9a-f-]{36})/i);
+            const secMatch = page.url.match(/[?&]section=([0-9a-f-]{36})/i);
+            const convId = convMatch ? convMatch[1] : "";
+            const sectionProjId = secMatch ? secMatch[1] : "";
+            const projId =
+              sectionProjId ||
+              (convId && profilesMeta?.convProjectMap?.[convId]) ||
+              (convId ? resolveProjectIdByConvId(convId, convDbPath) : "");
+            resolve({ convId, projectId: projId || "" });
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      });
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.on("error", () => resolve(null));
+    } catch (e) {
+      resolve(null);
+    }
+  });
 }
 
 function ensureSidecarServerRunning() {
@@ -419,31 +475,29 @@ async function main() {
     }
 
     // 检测当前触发 Hook 的会话是否为「后台运行对话」（前台已切换到其他项目）
-    let storageHeadConvId = "";
-    try {
-      const storage = readJsonRobust(APP_STORAGE_FILE, null);
-      if (storage && storage.projectsConversationOrder) {
-        const order = typeof storage.projectsConversationOrder === "string"
-          ? JSON.parse(storage.projectsConversationOrder)
-          : storage.projectsConversationOrder;
-        if (Array.isArray(order) && order.length > 0 && typeof order[0] === "string") {
-          storageHeadConvId = order[0];
-        }
-      }
-    } catch (e) {}
+    // 核心铁律：宿主切换项目/历史对话仅改 Electron 内存路由而不更新磁盘 app_storage.json，且面板关闭时 lastSidecarProjectId 会停留在旧值；
+    // 因此优先直读 DevToolsActivePort 主窗口实时内存路由（< 1ms）作为前后台裁决唯一真源！
+    const liveRoute = await getFocusedWindowRouteCdp(CONV_DB_PATH, profiles.__meta__);
+    let isBackgroundConv = false;
 
-    const foregroundSidecarProjId = profiles.__meta__.lastSidecarProjectId || "";
-    const lastSidecarPollAt = Number(profiles.__meta__.lastSidecarPollAt || 0);
-    const isSidecarActivelyTrackingOtherProject = Boolean(
-      foregroundSidecarProjId &&
-      foregroundSidecarProjId !== activeProjectId &&
-      (Date.now() - lastSidecarPollAt < 8000)
-    );
-    const isBackgroundConv = Boolean(
-      isSidecarActivelyTrackingOtherProject ||
-      (payloadConvId && storageHeadConvId && payloadConvId !== storageHeadConvId) ||
-      (foregroundSidecarProjId && foregroundSidecarProjId !== activeProjectId && payloadConvId && payloadConvId !== profiles.__meta__.lastSidecarConvId)
-    );
+    if (liveRoute && (liveRoute.projectId || liveRoute.convId)) {
+      if (liveRoute.projectId && liveRoute.projectId !== activeProjectId) {
+        isBackgroundConv = true;
+      } else if (!liveRoute.projectId && liveRoute.convId && payloadConvId && liveRoute.convId !== payloadConvId) {
+        isBackgroundConv = true;
+      } else {
+        isBackgroundConv = false;
+      }
+    } else {
+      // 仅当 CDP 端口不可达时，才使用带 8 秒新鲜度校验的 Sidecar 轮询标记兜底（严禁使用未校验时间戳的陈旧 lastSidecarConvId 或不写盘的 storageHeadConvId）
+      const foregroundSidecarProjId = profiles.__meta__.lastSidecarProjectId || "";
+      const lastSidecarPollAt = Number(profiles.__meta__.lastSidecarPollAt || 0);
+      isBackgroundConv = Boolean(
+        foregroundSidecarProjId &&
+        foregroundSidecarProjId !== activeProjectId &&
+        (Date.now() - lastSidecarPollAt < 8000)
+      );
+    }
 
     // 若为后台对话调用（无论 pre-tool 还是 pre-invocation），当宿主主窗口正聚焦在其他项目时，绝对不篡改前台活跃项目 ID 与全局 config.json，防止把前台项目插件偷偷关掉
     if (isBackgroundConv) {

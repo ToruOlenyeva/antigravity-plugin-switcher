@@ -11,7 +11,7 @@ const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT
 // 跨账户同源解析：优先从插件自身所在的物理路径向上反推宿主用户主目录（防止桌面登录非管理员账户 toru-work 而 Antigravity 以管理员 z9685 运行时 os.homedir() 错位）
 function resolveHostHomeDir() {
   const normalized = __dirname.replace(/\\/g, "/");
-  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
+  const geminiIdx = normalized.toLowerCase().lastIndexOf("/.gemini/");
   if (geminiIdx > 0) {
     const candidate = path.normalize(__dirname.slice(0, geminiIdx));
     if (fs.existsSync(candidate)) return candidate;
@@ -38,7 +38,7 @@ for (const backendFile of ["main.mjs", "scanner.mjs", "ls-bridge.mjs"]) {
 }
 
 // 若当前进程为 Antigravity 宿主拉起的内置 Sidecar（携带动态端口），自动驱逐可能霸占 8088 端口的旧独立进程，确保单进程双端口同源输出
-if (PORT !== 8088 && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+if (PORT !== 8088 && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT && process.env.PLUGIN_SWITCHER_DISABLE_8088 !== "1") {
   try {
     const evictReq = http.request({
       hostname: "127.0.0.1",
@@ -537,12 +537,14 @@ function extractConfigPluginSnapshot(config) {
   return snap;
 }
 
-function recordConfigWriteMeta(profiles, config, appliedProjectId = "") {
+function recordConfigWriteMeta(profiles, config, appliedProjectId = "", didWriteConfigFile = true) {
   if (!profiles || typeof profiles !== "object") return;
   if (!profiles.__meta__) profiles.__meta__ = {};
   const now = Date.now();
-  lastInternalConfigWriteMs = now;
-  profiles.__meta__.lastInternalConfigWriteAt = now;
+  if (didWriteConfigFile) {
+    lastInternalConfigWriteMs = now;
+    profiles.__meta__.lastInternalConfigWriteAt = now;
+  }
   profiles.__meta__.lastAppliedConfigSnapshot = extractConfigPluginSnapshot(config);
   if (appliedProjectId && appliedProjectId !== DEFAULT_KEY) {
     profiles.__meta__.lastAppliedProjectId = appliedProjectId;

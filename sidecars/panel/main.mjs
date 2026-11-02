@@ -822,7 +822,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`[PluginSwitcher Sidecar] Listening on http://127.0.0.1:${PORT} (Antigravity Port: ${process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || "custom"})`);
 });
 
-if (PORT !== 8088) {
+if (PORT !== 8088 && process.env.PLUGIN_SWITCHER_DISABLE_8088 !== "1") {
   let retryCount = 0;
   const standaloneServer = http.createServer(requestHandler);
 
@@ -943,8 +943,26 @@ async function handleExternalConfigFileChange() {
     const lastBgHookAt = Number(profiles?.__meta__?.lastBgHookAt || 0);
     if (nowMs - lastProfileWriteAt <= 800 || nowMs - lastSwitchAt <= 1500 || nowMs - lastBgHookAt <= 1500) return;
 
-    // 若用户未打开右侧面板（sseClients.size === 0）且刚在左侧切换到新项目后直接去改原生 Settings，先切档对齐新项目，严禁将旧项目快照变化串写到新项目或旧项目
+    // 若用户未打开右侧面板（sseClients.size === 0）且刚在左侧切换到新项目后直接去改原生 Settings：
+    // 先将本次用户在原生 Settings 中手动拨动的差量开关写入新项目 routeProjectId 的档案，再调用 getSystemState 切档对齐新项目其余插件！
     if (routeProjectId && profiles?.__meta__?.lastActiveProjectId && routeProjectId !== profiles.__meta__.lastActiveProjectId) {
+      const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
+      const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
+      const targetProfile = profiles[routeProjectId];
+      if (snap && targetProfile && targetProfile.plugins) {
+        let userDeltaApplied = false;
+        for (const [pluginDir, pluginCfg] of Object.entries(config.plugins || {})) {
+          if (PROTECTED_PLUGINS.has(pluginDir)) continue;
+          const enabledInConfig = Boolean(pluginCfg && pluginCfg.enabled !== false);
+          if (snap[pluginDir] !== undefined && Boolean(snap[pluginDir]) !== enabledInConfig) {
+            targetProfile.plugins[pluginDir] = enabledInConfig;
+            userDeltaApplied = true;
+          }
+        }
+        if (userDeltaApplied) {
+          writeJsonSafe(PROFILES_FILE, profiles);
+        }
+      }
       const stateData = getSystemState({ clientProjectId: routeProjectId, isPassive: false });
       broadcastStateToAllFrontends(stateData, true);
       return;
@@ -968,7 +986,7 @@ async function handleExternalConfigFileChange() {
     }
 
     if (changed) {
-      recordConfigWriteMeta(profiles, config, lastActiveId);
+      recordConfigWriteMeta(profiles, config, lastActiveId, false);
       writeJsonSafe(PROFILES_FILE, profiles);
       console.log(`[PluginSwitcher Sidecar] Instant native Settings sync -> project ${lastActiveId}`);
       const stateData = getSystemState({ isPassive: false });

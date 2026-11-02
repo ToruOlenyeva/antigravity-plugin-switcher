@@ -647,10 +647,10 @@ function getSystemState(query = {}) {
         if (configRepairNeeded) {
           writeJsonSafe(CONFIG_FILE, config);
           notifyLanguageServer(repairRpcUpdates);
-          recordConfigWriteMeta(profiles, config);
+          recordConfigWriteMeta(profiles, config, activeProjectId, true);
           profilesModified = true;
         } else if (profileChanged) {
-          recordConfigWriteMeta(profiles, config);
+          recordConfigWriteMeta(profiles, config, activeProjectId, false);
           profilesModified = true;
         }
       }
