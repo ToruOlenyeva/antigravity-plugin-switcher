@@ -853,7 +853,8 @@ if (PORT !== 8088 && process.env.PLUGIN_SWITCHER_DISABLE_8088 !== "1") {
         } catch (e) {}
         setTimeout(tryBind8088, 350);
       } else {
-        setTimeout(tryBind8088, 3000);
+        // 8088 已被另一正在运行的 Antigravity 宿主实例持有，当前多开窗口仅使用自身独立分配的 PORT，不再循环争抢
+        try { standaloneServer.close(); } catch (e) {}
       }
     } else {
       console.log(`[PluginSwitcher Sidecar] Standalone port 8088 listener notice: ${err.message}`);

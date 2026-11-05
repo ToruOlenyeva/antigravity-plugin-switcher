@@ -37,13 +37,13 @@ for (const backendFile of ["main.mjs", "scanner.mjs", "ls-bridge.mjs"]) {
   } catch (e) {}
 }
 
-// 若当前进程为 Antigravity 宿主拉起的内置 Sidecar（携带动态端口），自动驱逐可能霸占 8088 端口的旧独立进程，确保单进程双端口同源输出
+// 若当前进程为 Antigravity 宿主拉起的内置 Sidecar（携带动态端口），仅驱逐可能霸占 8088 端口的旧独立进程（onlyStandalone=1），绝不误杀其他多开宿主窗口的内置 Sidecar
 if (PORT !== 8088 && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT && process.env.PLUGIN_SWITCHER_DISABLE_8088 !== "1") {
   try {
     const evictReq = http.request({
       hostname: "127.0.0.1",
       port: 8088,
-      path: "/api/restart-sidecar",
+      path: "/api/restart-sidecar?onlyStandalone=1",
       method: "POST",
       timeout: 600
     }, () => {});
