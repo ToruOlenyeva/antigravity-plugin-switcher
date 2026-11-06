@@ -8,6 +8,8 @@ import {
   APP_STORAGE_FILE,
   PROTECTED_PLUGINS,
   DEFAULT_KEY,
+  resolveSwitcherInstanceContext,
+  resolveLsRpcTarget,
   isValidPluginDirectory,
   resolveProjectIdFromDb,
   getFocusedWindowRoute,
@@ -21,12 +23,16 @@ import {
   isInternalConfigWriteSettled
 } from "./ls-bridge.mjs";
 
-function scanAntigravityProjects() {
+function scanAntigravityProjects(instanceCtx = null) {
   const projectList = [];
   if (!fs.existsSync(PROJECTS_DIR)) return projectList;
 
-  // 1. 读取侧边栏拖拽顺序
-  const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(0);
+  // 1. 读取侧边栏拖拽顺序（优先读取当前实例，若为空则回退主实例）
+  let appStorage = readJsonSafe(ctx.appStorageFile || APP_STORAGE_FILE, {});
+  if (!appStorage.projectsOrder && ctx.appStorageFile !== APP_STORAGE_FILE) {
+    appStorage = readJsonSafe(APP_STORAGE_FILE, {});
+  }
 
   let orderArray = [];
   try {
@@ -221,15 +227,9 @@ function resolveConvIdFromToken(token, appStorage) {
 
 const SIDECAR_BOOT_ID = String(Date.now());
 const instancePollTracker = new Map();
+const lastIdeContextByInstance = new Map();
 
-let lastIdeContext = {
-  activeProjectId: "",
-  effectiveConvId: "",
-  workspaceUri: "",
-  updatedAt: 0
-};
-
-function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta = null) {
+function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta = null, instanceCtx = null) {
   let convId = "";
   let clientProjectId = "";
   let clientWorkspaceUri = "";
@@ -244,11 +244,19 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     token = params.token || "";
   }
 
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(params?.localPort || 0);
+  const instKey = ctx.instanceId || "main";
   const meta = profilesMeta || (readJsonSafe(PROFILES_FILE, {}).__meta__) || {};
+  const instMeta = meta?.instances?.[instKey] || {};
+  const lastIdeContext = lastIdeContextByInstance.get(instKey) || {
+    activeProjectId: "",
+    effectiveConvId: "",
+    workspaceUri: "",
+    updatedAt: 0
+  };
 
-  // 第一权威源：Antigravity Electron 主窗口实时路由 (/c/<convId>?section=<projectId> 或 /c/<convId>)
-  // 无论内置 Sidecar 是否打开、是否存在多个并发后台 iframe 轮询，主窗口 page 路由永远 100% 反映用户当前真实焦点！
-  const windowRoute = getFocusedWindowRoute();
+  // 第一权威源：当前实例 Antigravity Electron 窗口实时路由 (/c/<convId>?section=<projectId> 或 /c/<convId>)
+  const windowRoute = getFocusedWindowRoute(ctx);
   if (windowRoute && (windowRoute.projectId || windowRoute.convId) && (Date.now() - windowRoute.updatedAt < 10000)) {
     const resolvedRouteProjId =
       windowRoute.projectId ||
@@ -259,12 +267,12 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
       const effectiveConvId = windowRoute.convId || convId || "";
       const activeWorkspace = (matchedProj.primaryPath || clientWorkspaceUri || "").replace(/\\/g, "/");
       const isNewConvoContext = Boolean(!windowRoute.convId);
-      lastIdeContext = {
+      lastIdeContextByInstance.set(instKey, {
         activeProjectId: matchedProj.id,
         effectiveConvId,
         workspaceUri: activeWorkspace,
         updatedAt: Date.now()
-      };
+      });
       return {
         activeProjectId: matchedProj.id,
         effectiveConvId,
@@ -290,8 +298,8 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
     }
   }
 
-  // 优先级 3：CDP 端口不可达时的轻量兜底（SQLite 精确查表 -> workspaceUri 路径匹配 -> 最近活跃项目）
-  const appStorage = readJsonSafe(APP_STORAGE_FILE, {});
+  // 优先级 3：CDP 端口不可达时的按实例轻量兜底
+  const appStorage = readJsonSafe(ctx.appStorageFile || APP_STORAGE_FILE, {});
   if (!convId && token) {
     const tokenRes = resolveConvIdFromToken(token, appStorage);
     if (tokenRes.convId) convId = tokenRes.convId;
@@ -315,7 +323,9 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
       activeProjectId = rawNewConvoProjId;
     } else if (lastIdeContext.activeProjectId && projects.some((p) => p.id === lastIdeContext.activeProjectId)) {
       activeProjectId = lastIdeContext.activeProjectId;
-    } else if (meta.lastActiveProjectId && projects.some((p) => p.id === meta.lastActiveProjectId)) {
+    } else if (instMeta.lastActiveProjectId && projects.some((p) => p.id === instMeta.lastActiveProjectId)) {
+      activeProjectId = instMeta.lastActiveProjectId;
+    } else if (!ctx.isIsolatedInstance && meta.lastActiveProjectId && projects.some((p) => p.id === meta.lastActiveProjectId)) {
       activeProjectId = meta.lastActiveProjectId;
     }
   }
@@ -342,6 +352,7 @@ function getSystemState(query = {}) {
   let isPassive = false;
   let hasActiveFlag = false;
   let isInit = false;
+  let localPort = 0;
 
   if (typeof query === "string") {
     convId = query;
@@ -355,7 +366,10 @@ function getSystemState(query = {}) {
     isPassive = query.isPassive === true;
     hasActiveFlag = query.hasActiveFlag === true;
     isInit = query.isInit === true;
+    localPort = Number(query.localPort || 0);
   }
+  const instanceCtx = query?.instanceCtx || resolveSwitcherInstanceContext(localPort);
+  const instKey = instanceCtx.instanceId || "main";
   const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
   const profilesFileExistedOnDisk = fs.existsSync(PROFILES_FILE) || fs.existsSync(`${PROFILES_FILE}.bak`);
   const rawProfiles = readJsonSafe(PROFILES_FILE, {});
@@ -386,7 +400,7 @@ function getSystemState(query = {}) {
     };
   }
 
-  const projects = scanAntigravityProjects();
+  const projects = scanAntigravityProjects(instanceCtx);
   const validProjectIds = new Set(projects.map(p => p.id));
 
   // 2. 清洗 profiles：剔除所有基于磁盘物理路径的冗余顶层 Key 与伪插件 Sidecar 残留项，仅保留真实项目 UUID 和特殊 Key
@@ -478,23 +492,47 @@ function getSystemState(query = {}) {
     }
   }
 
-  // 4. 精准探测当前活跃项目（以 Electron 主窗口实时路由 /c/<convId>?section=<projectId> + node:sqlite 为唯一权威源）
+  // 4. 精准探测当前实例活跃项目（按实例各自的 DevToolsActivePort 路由独立识别）
   if (!profiles.__meta__) {
     profiles.__meta__ = {};
   }
   if (!profiles.__meta__.convProjectMap || typeof profiles.__meta__.convProjectMap !== "object") {
     profiles.__meta__.convProjectMap = {};
   }
+  if (!profiles.__meta__.instances || typeof profiles.__meta__.instances !== "object") {
+    profiles.__meta__.instances = {};
+  }
+  if (!profiles.__meta__.instances[instKey] || typeof profiles.__meta__.instances[instKey] !== "object") {
+    profiles.__meta__.instances[instKey] = {};
+  }
+  const instMeta = profiles.__meta__.instances[instKey];
 
   const now = Date.now();
+  const curTarget = resolveLsRpcTarget(profiles, instanceCtx);
+  if (curTarget && curTarget.port && curTarget.csrf) {
+    if (!instMeta.lsRpcTarget || instMeta.lsRpcTarget.port !== curTarget.port || instMeta.lsRpcTarget.csrf !== curTarget.csrf) {
+      instMeta.lsRpcTarget = {
+        hostname: curTarget.hostname,
+        port: curTarget.port,
+        csrf: curTarget.csrf,
+        updatedAt: now
+      };
+      if (!instanceCtx.isIsolatedInstance) {
+        profiles.__meta__.lsRpcTarget = instMeta.lsRpcTarget;
+      }
+      profilesModified = true;
+    }
+  }
+
   const { activeProjectId, effectiveConvId, activeWorkspace, isNewConvoContext, source } = resolveCurrentActiveProjectId(
-    { convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId },
+    { convId, clientProjectId, clientWorkspaceUri, token, sidecarProjectId, localPort },
     projects,
-    profiles.__meta__
+    profiles.__meta__,
+    instanceCtx
   );
 
-  // 当主窗口实时路由在线时（source === "electron-window-route"），主窗口当前焦点即为唯一权威，后台非焦点 iframe 绝不劫持
-  const windowRoute = getFocusedWindowRoute();
+  // 当该实例窗口实时路由在线时（source === "electron-window-route"），当前实例焦点即为唯一权威
+  const windowRoute = getFocusedWindowRoute(instanceCtx);
   const isBackgroundTabPassive = Boolean(
     source !== "electron-window-route" &&
     windowRoute &&
@@ -515,45 +553,58 @@ function getSystemState(query = {}) {
       }
       profilesModified = true;
     }
-    profiles.__meta__.lastSidecarPollAt = now;
+    instMeta.lastSidecarPollAt = now;
+    if (!instanceCtx.isIsolatedInstance) {
+      profiles.__meta__.lastSidecarPollAt = now;
+    }
     if (!isPassive) {
+      instMeta.lastSidecarActiveAt = now;
       profiles.__meta__.lastSidecarActiveAt = now;
     }
-    profiles.__meta__.lastSidecarIsNewConvo = Boolean(isNewConvoContext);
+    instMeta.lastSidecarIsNewConvo = Boolean(isNewConvoContext);
     if (
-      profiles.__meta__.lastSidecarProjectId !== activeProjectId ||
-      profiles.__meta__.lastSidecarConvId !== effectiveConvId ||
-      profiles.__meta__.lastSidecarWorkspace !== activeWorkspace
+      instMeta.lastSidecarProjectId !== activeProjectId ||
+      instMeta.lastSidecarConvId !== effectiveConvId ||
+      instMeta.lastSidecarWorkspace !== activeWorkspace
     ) {
-      profiles.__meta__.lastSidecarProjectId = activeProjectId;
-      profiles.__meta__.lastSidecarConvId = effectiveConvId;
-      profiles.__meta__.lastSidecarWorkspace = activeWorkspace;
+      instMeta.lastSidecarProjectId = activeProjectId;
+      instMeta.lastSidecarConvId = effectiveConvId;
+      instMeta.lastSidecarWorkspace = activeWorkspace;
+      if (!instanceCtx.isIsolatedInstance) {
+        profiles.__meta__.lastSidecarProjectId = activeProjectId;
+        profiles.__meta__.lastSidecarConvId = effectiveConvId;
+        profiles.__meta__.lastSidecarWorkspace = activeWorkspace;
+      }
       profilesModified = true;
     }
-    lastIdeContext = {
+    lastIdeContextByInstance.set(instKey, {
       activeProjectId,
       effectiveConvId,
       workspaceUri: activeWorkspace,
       updatedAt: now
-    };
+    });
   }
 
-  // 5. 核心状态机：分清「跨项目切换（配置 -> 软件）」与「同项目内同步（软件 -> 配置）」
-  const lastActiveId = profiles.__meta__.lastActiveProjectId || "";
+  // 5. 核心状态机：分清「本实例跨项目切换 / 主动聚焦同步」与「同项目内同步」，杜绝双实例后台静默轮询互相抢写
+  const lastInstanceActiveId = instMeta.lastActiveProjectId || "";
+  const instanceNeedsApply = Boolean(
+    activeProjectId &&
+    activeProjectId !== DEFAULT_KEY &&
+    (lastInstanceActiveId !== activeProjectId || instMeta.lastAppliedProjectId !== activeProjectId || (hasActiveFlag && profiles.__meta__.lastAppliedProjectId !== activeProjectId))
+  );
 
   if (activeProjectId && activeProjectId !== DEFAULT_KEY && profiles[activeProjectId]) {
     const activeProfile = profiles[activeProjectId];
 
-    if (lastActiveId !== activeProjectId) {
+    if (instanceNeedsApply) {
       if (isBackgroundTabPassive) {
-        // 后台隐藏标签页轮询：跳过写盘，仅对齐返回的内存态，绝不覆写 config.json 干扰前台项目或后台运行任务
         for (const p of installedPlugins) {
           if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
             p.enabled = Boolean(activeProfile.plugins[p.dir]);
           }
         }
       } else {
-        // 分支 A：跨项目切换跃变！正向将该项目的独立配置写入 config.json，并强制同步 LS 内存态
+        // 分支 A：当前实例发生项目跃变或首次绑定该项目（如多开实例处于「聊天」项目），正向将该项目的配置同步至当前实例 LS 与 config.json
         if (!config.plugins) config.plugins = {};
         const rpcUpdates = {};
         let configChanged = false;
@@ -570,10 +621,11 @@ function getSystemState(query = {}) {
           }
         }
 
-        // 先更新并落盘 profiles 元数据（含 lastProjectSwitchAt、lastInternalConfigWriteAt、lastAppliedProjectId），防止 config.json 触发 fs.watch 时读到旧快照
+        instMeta.lastActiveProjectId = activeProjectId;
+        instMeta.lastProjectSwitchAt = Date.now();
         profiles.__meta__.lastActiveProjectId = activeProjectId;
         profiles.__meta__.lastProjectSwitchAt = Date.now();
-        recordConfigWriteMeta(profiles, config, activeProjectId);
+        recordConfigWriteMeta(profiles, config, activeProjectId, true, instanceCtx);
         profilesModified = true;
         if (allowProfilesDiskWrite) {
           writeJsonSafe(PROFILES_FILE, profiles);
@@ -584,10 +636,9 @@ function getSystemState(query = {}) {
           writeJsonSafe(CONFIG_FILE, config);
         }
         if (Object.keys(rpcUpdates).length > 0) {
-          notifyLanguageServer(rpcUpdates);
+          notifyLanguageServer(rpcUpdates, profiles, instanceCtx);
         }
 
-        // 无论 config.json 是否有差异，均强制同步更新 installedPlugins 内存显示与快照
         for (const p of installedPlugins) {
           if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
             p.enabled = Boolean(activeProfile.plugins[p.dir]);
@@ -595,21 +646,23 @@ function getSystemState(query = {}) {
         }
       }
     } else {
-      // 分支 B：停留在同一项目内！通过比对 lastAppliedConfigSnapshot 区分「用户在软件原生设置中手动改开关」与「跨项目残留状态」
+      // 分支 B：当前实例停留在同一项目内
       const nowMs = Date.now();
       const lastBgHookAt = Number(profiles.__meta__.lastBgHookAt || 0);
       const lastProfileWriteAt = Number(profiles.__meta__.lastInternalConfigWriteAt || 0);
       const lastSwitchAt = Number(profiles.__meta__.lastProjectSwitchAt || 0);
-      const snapshotOwnerMatches = !profiles.__meta__.lastAppliedProjectId || profiles.__meta__.lastAppliedProjectId === activeProjectId;
-      // 1) 原生 Settings 手动拨动（divergedFromSnapshot === true）：需内部写盘静默 600ms 且距上次跨项目切换 > 1500ms 且距后台 Hook > 1500ms
+      const snapshotOwnerMatches = Boolean(
+        profiles.__meta__.lastAppliedProjectId === activeProjectId &&
+        instMeta.lastAppliedProjectId === activeProjectId
+      );
       const canSyncNativeToggle =
         snapshotOwnerMatches &&
         isInternalConfigWriteSettled(600) &&
         (nowMs - lastProfileWriteAt > 800) &&
         (nowMs - lastSwitchAt > 1500) &&
         (nowMs - lastBgHookAt > 1500);
-      // 2) 后台其他项目 Hook 瞬态下发残留或 LS 滞后残留：主动自愈回写前台项目配置
       const canRepairBgResidual =
+        snapshotOwnerMatches &&
         isInternalConfigWriteSettled(600) &&
         (nowMs - lastProfileWriteAt > 800) &&
         (nowMs - lastBgHookAt > 1500);
@@ -624,13 +677,11 @@ function getSystemState(query = {}) {
           if (p.protected) continue;
           const profileVal = activeProfile.plugins[p.dir] !== undefined ? Boolean(activeProfile.plugins[p.dir]) : p.enabled;
           if (profileVal !== p.enabled) {
-            // 仅当存在基准快照且当前 config.json 与基准快照不一致时，才证明用户在 Antigravity 原生 Settings 中手动拨动了该开关
             const divergedFromSnapshot = !snap || snap[p.dir] === undefined || Boolean(snap[p.dir]) !== p.enabled;
             if (divergedFromSnapshot) {
               activeProfile.plugins[p.dir] = p.enabled;
               profileChanged = true;
             } else if (canRepairBgResidual) {
-              // config.json 与上次本插件下发的快照相同（说明是后台其他项目的 Hook 下发残留），绝不反向污染当前项目 Profile，并主动自愈修复！
               p.enabled = profileVal;
               if (!config.plugins) config.plugins = {};
               if (!config.plugins[p.dir]) config.plugins[p.dir] = {};
@@ -638,7 +689,6 @@ function getSystemState(query = {}) {
               repairRpcUpdates[p.dir] = { enabled: profileVal };
               configRepairNeeded = true;
             } else {
-              // 后台 Hook 保护期内，面板内存展示始终锁定为当前前台项目的真实 Profile 状态
               p.enabled = profileVal;
             }
           }
@@ -646,12 +696,19 @@ function getSystemState(query = {}) {
 
         if (configRepairNeeded) {
           writeJsonSafe(CONFIG_FILE, config);
-          notifyLanguageServer(repairRpcUpdates);
-          recordConfigWriteMeta(profiles, config, activeProjectId, true);
+          notifyLanguageServer(repairRpcUpdates, profiles, instanceCtx);
+          recordConfigWriteMeta(profiles, config, activeProjectId, true, instanceCtx);
           profilesModified = true;
         } else if (profileChanged) {
-          recordConfigWriteMeta(profiles, config, activeProjectId, false);
+          recordConfigWriteMeta(profiles, config, activeProjectId, false, instanceCtx);
           profilesModified = true;
+        }
+      } else {
+        // 当共享 config.json 刚被另一实例的项目写入时，当前实例面板展示与 LS 内存态依然保持当前实例 activeProfile 的真实状态
+        for (const p of installedPlugins) {
+          if (!p.protected && activeProfile.plugins[p.dir] !== undefined) {
+            p.enabled = Boolean(activeProfile.plugins[p.dir]);
+          }
         }
       }
     }
@@ -665,6 +722,8 @@ function getSystemState(query = {}) {
 
   return {
     bootId: SIDECAR_BOOT_ID,
+    instanceId: instKey,
+    standalonePort: instanceCtx.standalonePort || 8088,
     plugins: installedPlugins,
     profiles,
     projects,

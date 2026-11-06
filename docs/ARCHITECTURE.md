@@ -71,9 +71,9 @@ plugin-switcher/
 
 ### 级别 1：Electron 主窗口动态路由直读（`DevToolsActivePort` 唯一权威真相源）
 由于用户在 Antigravity 左侧点击切换项目或历史对话时，宿主<b>仅在 Electron 纯内存中更新前端路由而不修改磁盘上的 `app_storage.json` 或 `conversation_summaries.db`</b>（直至用户真正发出新消息才落盘），严禁依赖监听磁盘文件判断窗口切换；Sidecar 优先通过宿主暴露的标准 Chromium 调试接口直读当前焦点主窗口内存路由：
-- <b>动态端口发现（零硬编码端口）</b>：`ls-bridge.mjs` 中的 `discoverElectronCdpPort()` 优先读取 `<AppData>/Antigravity/DevToolsActivePort` 首行记录的动态调试端口（客户端每次重启分配新随机端口时均自动刷新该文件，并以 `language_server.log` 尾部 `ws://127.0.0.1:<port>/devtools/browser/` 正则匹配作为次级兜底）。
-- <b>主窗口路由实时提取（`< 3ms`）</b>：`refreshFocusedWindowRoute()` 请求 `http://127.0.0.1:<port>/json`，定位主窗口 `page` Target 的实时路由 URL（`https://127.0.0.1:8985/c/<convId>?section=<projectId>`），直接提取当前焦点会话 `convId` 与所属项目 `sectionProjId`，并同步写入进程级缓存 `convIdProjectCache`。
-- <b>彻底免疫后台失焦 `iframe` 轮询劫持与历史脏缓存</b>：由于宿主主窗口任意时刻只有一个激活路由，后端以 `getFocusedWindowRoute()` 为最高优先级裁决源（`source: "electron-window-route"`），忽略未销毁的后台会话 `iframe` 轮询参数，并自动清理 `project-plugin-profiles.json` 中历史残留的 `convProjectMap` 脏映射。
+- <b>动态端口发现（零硬编码端口，按实例隔离）</b>：`ls-bridge.mjs` 中的 `discoverElectronCdpPort(instanceCtx)` 优先读取对应实例 `<userDataDir>/DevToolsActivePort` 首行记录的动态调试端口（客户端每次重启分配新随机端口时均自动刷新该文件，并以该实例 `language_server.log` 尾部 `ws://127.0.0.1:<port>/devtools/browser/` 正则匹配作为次级兜底）。
+- <b>主窗口路由实时提取（`< 3ms`，兼容 `?section=` 与 `?project=`）</b>：`refreshFocusedWindowRoute()` 请求 `http://127.0.0.1:<port>/json`，定位主窗口 `page` Target 的实时路由 URL（`https://127.0.0.1:<port>/c/<convId>?project=<projectId>` 或 `?section=<projectId>`），直接提取当前实例焦点会话 `convId` 与所属项目 `sectionProjId`，并同步写入进程级缓存 `convIdProjectCache`。
+- <b>彻底免疫后台失焦 `iframe` 轮询劫持与历史脏缓存</b>：由于各实例主窗口任意时刻只有一个激活路由，后端以 `getFocusedWindowRoute(instanceCtx)` 为最高优先级裁决源（`source: "electron-window-route"`），忽略未销毁的后台会话 `iframe` 轮询参数，并自动清理 `project-plugin-profiles.json` 中历史残留的 `convProjectMap` 脏映射。
 
 ### 级别 2：显式参数、SQLite 毫秒级直查与多工作区路径打分
 当主窗口处于未打开具体会话的过渡态或由生命周期 Hook 独立触发时：
@@ -118,13 +118,13 @@ plugin-switcher/
   - 修改当前带绿点 <code>●</code> 的活跃项目 B（或默认配置 <code>__default__</code>）的开关时，立即写入 <code>config.json</code> 并通过 <code>ls-bridge.mjs</code> 派发 Language Server RPC 实时热重载指令（提示「已实时同步至当前活跃项目」）；
   - 后台 <code>2.5s</code> 静默心跳（<code>syncActiveProjectSilently</code>）<b>仅在宿主活跃项目发生真实物理跃变（<code>nextHostActiveId !== lastHostActiveId</code>）时</b>才自动将下拉框跟随切换至新活跃项目；宿主未切换项目时，绝不打断用户正在跨项目预览编辑的界面。
 
-### 3.3 单进程双端口同源托管与 <code>http://localhost:8088</code> SSE 零延迟双输出镜像
-- <b>跨账户同源主目录反推与单进程双端口监听（<code>ls-bridge.mjs</code> + <code>main.mjs</code>）</b>：
+### 3.3 单后端双克隆端口（<code>8088</code> / <code>8098</code>）独立识别活跃项目与跨实例共享预设实时同步
+- <b>跨账户同源主目录反推与双实例克隆端口监听（<code>ls-bridge.mjs</code> + <code>main.mjs</code>）</b>：
   - 针对 Windows 桌面登录标准账户而 Antigravity 宿主以管理员账户运行（或跨账户环境）导致的 <code>os.homedir()</code> 错位，后端通过 <code>resolveHostHomeDir()</code> 直接从插件自身所在的物理路径向上反推真实宿主用户目录，确保配置与状态库 100% 同源；
-  - 宿主拉起内置 Sidecar 时，同一 Node.js 进程同时监听宿主分配的动态端口（<code>ANTIGRAVITY_SIDECAR_WEB_PORT</code>）与独立 <code>8088</code> 端口（若 <code>8088</code> 被旧独立进程占用则自动通过 <code>POST /api/restart-sidecar</code> 驱逐接管），彻底消灭多进程脑裂。
-- <b>后端计算一次、<code>latestDualOutputState</code> + SSE（<code>GET /api/events</code>）零延迟双份输出</b>：
-  - 每当内置 Sidecar 请求 <code>GET /api/status</code> 计算出最新 <code>stateData</code> 时，后端立即将其缓存至内存 <code>latestDualOutputState</code>，并通过 <code>broadcastStateToAllFrontends(stateData)</code> 经由 <code>GET /api/events</code> (Server-Sent Events) <code>0ms</code> 实时推送给外部浏览器 <code>http://localhost:8088</code>；
-  - 外部浏览器 <code>http://localhost:8088</code> 通过 <code>new EventSource("/api/events")</code> 实时接收内置 Sidecar 的同一份状态数据包并立即更新 DOM，同时其常规 <code>GET /api/status</code> 请求直接复用 <code>latestDualOutputState.activeProjectId</code>（仅在内置 Sidecar 超过 <code>8s</code> 未轮询即面板关闭时，才回退使用 <code>app_storage.json</code> 置顶会话兜底），彻底杜绝独立猜状态导致的滞后与错位。
+  - 宿主拉起内置 Sidecar 时，同一后端配置库同时放出两个克隆端口（主实例 <code>8088</code> + 主实例动态端口；多开实例 <code>8098</code> + 多开实例动态端口，且 <code>bindAdditionalSidecarPorts</code> 严格排除其他实例正在使用的端口），两端口 100% 共享全部项目预设，仅按请求进入的端口（<code>req.socket.localPort</code>）独立识别对应实例的当前活跃项目。
+- <b>跨实例修改毫秒级双向同步（<code>fs.watch(PROFILES_FILE)</code> + <code>notifyMatchingInstancesLanguageServers</code>）与 SSE 零延迟广播</b>：
+  - 每当用户在任一实例面板修改任意项目的插件开关并保存时，后端立即通过 <code>notifyMatchingInstancesLanguageServers</code> 同步所有正处于该项目下的实例 Language Server，并通过 <code>fs.watch(PROFILES_FILE)</code> 与 <code>broadcastStateToAllFrontends(stateData)</code> 经由 <code>GET /api/events</code> (Server-Sent Events) <code>0ms</code> 实时推送给所有实例面板与外部 <code>8088</code> / <code>8098</code> 小窗；
+  - 外部浏览器 <code>http://localhost:8088</code>（主实例）与 <code>http://localhost:8098</code>（多开实例）通过 <code>new EventSource("/api/events")</code> 实时接收各自实例视角下的最新状态数据包并立即更新 DOM，同时在某实例切换到「聊天」等项目时自动将该实例运行态插件同步为对应项目预设。
 - <b>前端双观察者可见性感知与折叠态 SSE 断连 0% CPU 休眠（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
   - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver</code> 实时检测视口遮挡与真实可见性：当右侧面板被折叠收起、切至其他辅助栏标签页或旧对话 Sidecar iframe 退入后台不可见时，前端立即冻结 <code>2.5s</code> 定时轮询并主动调用 <code>close()</code> 断开 <code>EventSource("/api/events")</code> 连接，使后端 <code>sseClients.size</code> 归零进入 <code>0% CPU</code> 深度休眠；当面板重新展开可见时，立即重连 SSE 并触发一次主动同步（<code>isPassive = false</code>），瞬间驱动内置面板与 <code>8088</code> 同步翻转。
 

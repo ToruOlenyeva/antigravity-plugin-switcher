@@ -28,7 +28,7 @@ const appDataDir = (process.platform === "win32" && fs.existsSync(path.join(home
 for (const backendFile of ["main.mjs", "scanner.mjs", "ls-bridge.mjs"]) {
   const fullBackendPath = path.join(__dirname, backendFile);
   try {
-    fs.watchFile(fullBackendPath, { interval: 1500 }, (curr, prev) => {
+    fs.watchFile(fullBackendPath, { interval: 1500, persistent: false }, (curr, prev) => {
       if (curr.mtimeMs !== prev.mtimeMs) {
         console.log(`[PluginSwitcher Sidecar] Backend file ${backendFile} updated on disk, restarting sidecar...`);
         setTimeout(() => process.exit(0), 200);
@@ -56,14 +56,156 @@ const PLUGINS_DIR = path.join(homeDir, ".gemini", "config", "plugins");
 const CONFIG_FILE = path.join(homeDir, ".gemini", "config", "config.json");
 const PROFILES_FILE = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
 const PROJECTS_DIR = path.join(homeDir, ".gemini", "config", "projects");
-const APP_STORAGE_FILE = path.join(appDataDir, "Antigravity", "app_storage.json");
-const DEVTOOLS_ACTIVE_PORT_FILE = path.join(appDataDir, "Antigravity", "DevToolsActivePort");
-const LS_LOG_FILE = path.join(appDataDir, "Antigravity", "logs", "language_server.log");
+const MAIN_USER_DATA_DIR = path.join(appDataDir, "Antigravity");
+const INSTANCES_ROOT_DIR = path.join(homeDir, ".gemini", "antigravity-instances");
+const APP_STORAGE_FILE = path.join(MAIN_USER_DATA_DIR, "app_storage.json");
+const DEVTOOLS_ACTIVE_PORT_FILE = path.join(MAIN_USER_DATA_DIR, "DevToolsActivePort");
+const LS_LOG_FILE = path.join(MAIN_USER_DATA_DIR, "logs", "language_server.log");
 const CONV_DB_PATH = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
 const PROTECTED_PLUGINS = new Set(["plugin-switcher"]);
 const DEFAULT_KEY = "__default__";
 
 const PRELOAD_SDK_PATH = path.join(homeDir, ".gemini", "antigravity", "lib", "node_modules", "sidecar_sdk", "preload.js");
+
+function extractActiveSegmentFromLsLog(logFilePath) {
+  try {
+    if (!logFilePath || !fs.existsSync(logFilePath)) return { pid: 0, httpPort: 0, segment: "" };
+    const logText = fs.readFileSync(logFilePath, "utf-8");
+    const pidMatches = [...logText.matchAll(/Starting language server process with pid (\d+)/gi)];
+    let pid = 0;
+    let segment = logText;
+    if (pidMatches.length > 0) {
+      const last = pidMatches[pidMatches.length - 1];
+      pid = Number(last[1] || 0);
+      segment = typeof last.index === "number" ? logText.slice(last.index) : logText;
+    }
+    const httpMatches = [...segment.matchAll(/Language server listening on random port at (\d+) for HTTP\b/gi)];
+    const httpPort = httpMatches.length > 0 ? Number(httpMatches[httpMatches.length - 1][1] || 0) : 0;
+    return { pid, httpPort, segment };
+  } catch (e) {
+    return { pid: 0, httpPort: 0, segment: "" };
+  }
+}
+
+function buildInstanceContextObject(instanceId, userDataDir, isIsolatedInstance) {
+  const dir = userDataDir || MAIN_USER_DATA_DIR;
+  return {
+    instanceId: instanceId || "main",
+    isIsolatedInstance: Boolean(isIsolatedInstance),
+    userDataDir: dir,
+    devToolsActivePortFile: path.join(dir, "DevToolsActivePort"),
+    lsLogFile: path.join(dir, "logs", "language_server.log"),
+    appStorageFile: path.join(dir, "app_storage.json"),
+    standalonePort: isIsolatedInstance ? 8098 : 8088
+  };
+}
+
+function listAllSwitcherInstances() {
+  const list = [];
+  try {
+    if (fs.existsSync(INSTANCES_ROOT_DIR)) {
+      const dirs = fs.readdirSync(INSTANCES_ROOT_DIR);
+      const isoList = [];
+      for (const dirName of dirs) {
+        if (dirName.startsWith(".")) continue;
+        const fullDir = path.join(INSTANCES_ROOT_DIR, dirName);
+        const logFile = path.join(fullDir, "logs", "language_server.log");
+        const devPortFile = path.join(fullDir, "DevToolsActivePort");
+        if (fs.existsSync(logFile) || fs.existsSync(devPortFile)) {
+          let mtimeMs = 0;
+          try {
+            if (fs.existsSync(logFile)) mtimeMs = fs.statSync(logFile).mtimeMs;
+            else if (fs.existsSync(devPortFile)) mtimeMs = fs.statSync(devPortFile).mtimeMs;
+          } catch (e) {}
+          isoList.push({
+            ...buildInstanceContextObject(dirName, fullDir, true),
+            mtimeMs
+          });
+        }
+      }
+      isoList.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      list.push(...isoList);
+    }
+  } catch (e) {}
+  list.push(buildInstanceContextObject("main", MAIN_USER_DATA_DIR, false));
+  return list;
+}
+
+const portInstanceCache = new Map();
+
+function resolveSwitcherInstanceContext(localPort = 0) {
+  const targetPort = Number(localPort || PORT || 0);
+  const now = Date.now();
+  if (portInstanceCache.has(targetPort)) {
+    const cached = portInstanceCache.get(targetPort);
+    if (cached.confirmed || (now - cached.at < 1500)) {
+      return cached.ctx;
+    }
+  }
+
+  const allInstances = listAllSwitcherInstances();
+  const mainCtx = allInstances.find((x) => !x.isIsolatedInstance) || buildInstanceContextObject("main", MAIN_USER_DATA_DIR, false);
+  const primaryIsoCtx = allInstances.find((x) => x.isIsolatedInstance) || null;
+
+  // 1. 显式克隆端口映射：8088 固定映射主实例，8098 固定映射多开实例
+  if (targetPort === 8088) {
+    portInstanceCache.set(targetPort, { ctx: mainCtx, confirmed: true, at: now });
+    return mainCtx;
+  }
+  if (targetPort === 8098 && primaryIsoCtx) {
+    portInstanceCache.set(targetPort, { ctx: primaryIsoCtx, confirmed: true, at: now });
+    return primaryIsoCtx;
+  }
+
+  // 2. 精确匹配各实例 language_server.log 中分配给 plugin-switcher/panel 的动态端口或父进程 PID
+  const switcherPortRegex = targetPort > 0
+    ? new RegExp(`Sidecar\\s+plugin-switcher/panel\\s+gateway[^\\r\\n]*proxying to loopback port\\s+${targetPort}\\b`, "i")
+    : null;
+  const genericPortRegex = targetPort > 0
+    ? new RegExp(`proxying to loopback port\\s+${targetPort}\\b`, "i")
+    : null;
+  const ppid = Number(process.ppid || 0);
+
+  for (const cand of allInstances) {
+    const { pid, httpPort, segment } = extractActiveSegmentFromLsLog(cand.lsLogFile);
+    const matchedPort = Boolean(
+      segment &&
+      ((switcherPortRegex && switcherPortRegex.test(segment)) || (genericPortRegex && genericPortRegex.test(segment)))
+    );
+    const matchedPpid = Boolean(targetPort === PORT && ppid > 0 && pid > 0 && pid === ppid);
+    if (matchedPort || matchedPpid) {
+      const resolved = { ...cand, lsPid: pid, lsHttpPort: httpPort };
+      portInstanceCache.set(targetPort, { ctx: resolved, confirmed: true, at: now });
+      return resolved;
+    }
+  }
+
+  // 3. 环境变量与隔离 HOME 路径匹配（适用于当前进程默认上下文）
+  if (targetPort === PORT || targetPort === 0) {
+    const envDir = String(process.env.AGY_RELAY_INSTANCE_USER_DATA_DIR || "").trim();
+    const envId = String(process.env.AGY_RELAY_INSTANCE_ID || "").trim();
+    if (envDir && fs.existsSync(envDir)) {
+      const id = envId || path.basename(envDir);
+      const resolved = buildInstanceContextObject(id, envDir, id !== "main");
+      portInstanceCache.set(targetPort, { ctx: resolved, confirmed: true, at: now });
+      return resolved;
+    }
+    const rawUserProfile = String(process.env.USERPROFILE || process.env.HOME || "").replace(/\\/g, "/");
+    const isoMatch = rawUserProfile.match(/antigravity-instances\/([^/]+)/i);
+    if (isoMatch && isoMatch[1]) {
+      const id = isoMatch[1].trim();
+      const isoDir = path.join(INSTANCES_ROOT_DIR, id);
+      if (fs.existsSync(isoDir)) {
+        const resolved = buildInstanceContextObject(id, isoDir, true);
+        portInstanceCache.set(targetPort, { ctx: resolved, confirmed: true, at: now });
+        return resolved;
+      }
+    }
+  }
+
+  portInstanceCache.set(targetPort, { ctx: mainCtx, confirmed: false, at: now });
+  return mainCtx;
+}
 
 function isValidPluginDirectory(dirName) {
   if (!dirName || typeof dirName !== "string" || dirName.startsWith(".") || dirName.includes("..") || dirName.includes("/") || dirName.includes("\\")) return false;
@@ -187,38 +329,44 @@ function getLatestActiveProjectIdFromDb() {
   return "";
 }
 
-// 动态发现 Antigravity Electron 主窗口的本地 CDP 端口（绝不写死端口）
-// 优先级 1：读取 Chromium 官方标准动态端口文件 <AppData>/Antigravity/DevToolsActivePort 第 1 行
-// 优先级 2：从 <AppData>/Antigravity/logs/language_server.log 尾部提取最新 WS URL 端口
-let cachedCdpPort = 0;
-let cachedCdpPortAt = 0;
+// 动态发现指定实例 Antigravity Electron 主窗口的本地 CDP 端口（按实例隔离，绝不串窗）
+// 优先级 1：读取该实例 userDataDir 下的 DevToolsActivePort 第 1 行
+// 优先级 2：从该实例 logs/language_server.log 尾部提取最新 WS URL 端口
+const cdpPortCacheByInstance = new Map();
+const routeCacheByInstance = new Map();
+const inflightRouteByInstance = new Map();
 
-function discoverElectronCdpPort(forceRefresh = false) {
+function discoverElectronCdpPort(forceRefresh = false, instanceCtx = null) {
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(PORT);
+  const instKey = ctx.instanceId || "main";
   const now = Date.now();
-  if (!forceRefresh && cachedCdpPort > 1024 && (now - cachedCdpPortAt < 5000)) {
-    return cachedCdpPort;
+  const cached = cdpPortCacheByInstance.get(instKey);
+  if (!forceRefresh && cached && cached.port > 1024 && (now - cached.at < 5000)) {
+    return cached.port;
   }
 
-  // 1. 首选读取 DevToolsActivePort 第一行（每次客户端重启分配随机端口都会自动刷新该文件）
+  const devToolsFile = ctx.devToolsActivePortFile || DEVTOOLS_ACTIVE_PORT_FILE;
+  const lsLogFile = ctx.lsLogFile || LS_LOG_FILE;
+
+  // 1. 首选读取该实例专属 DevToolsActivePort 第一行
   try {
-    if (fs.existsSync(DEVTOOLS_ACTIVE_PORT_FILE)) {
-      const raw = fs.readFileSync(DEVTOOLS_ACTIVE_PORT_FILE, "utf-8");
+    if (fs.existsSync(devToolsFile)) {
+      const raw = fs.readFileSync(devToolsFile, "utf-8");
       const firstLine = (raw.split(/\r?\n/)[0] || "").trim();
       const port = Number(firstLine);
       if (port > 1024 && port < 65535) {
-        cachedCdpPort = port;
-        cachedCdpPortAt = now;
+        cdpPortCacheByInstance.set(instKey, { port, at: now });
         return port;
       }
     }
   } catch (e) {}
 
-  // 2. 次选从 language_server.log 尾部动态提取
+  // 2. 次选从该实例专属 language_server.log 尾部动态提取
   try {
-    if (fs.existsSync(LS_LOG_FILE)) {
-      const stat = fs.statSync(LS_LOG_FILE);
+    if (fs.existsSync(lsLogFile)) {
+      const stat = fs.statSync(lsLogFile);
       const readSize = Math.min(stat.size, 24576);
-      const fd = fs.openSync(LS_LOG_FILE, "r");
+      const fd = fs.openSync(lsLogFile, "r");
       const buf = Buffer.alloc(readSize);
       fs.readSync(fd, buf, 0, readSize, Math.max(0, stat.size - readSize));
       fs.closeSync(fd);
@@ -227,27 +375,15 @@ function discoverElectronCdpPort(forceRefresh = false) {
       if (matches.length > 0) {
         const port = Number(matches[matches.length - 1][1]);
         if (port > 1024 && port < 65535) {
-          cachedCdpPort = port;
-          cachedCdpPortAt = now;
+          cdpPortCacheByInstance.set(instKey, { port, at: now });
           return port;
         }
       }
     }
   } catch (e) {}
 
-  return cachedCdpPort || 13305;
+  return (cached && cached.port) || 13305;
 }
-
-let latestWindowRoute = {
-  projectId: "",
-  convId: "",
-  sectionProjId: "",
-  rawUrl: "",
-  title: "",
-  port: 0,
-  updatedAt: 0
-};
-let inflightRoutePromise = null;
 
 function fetchCdpTargetsJson(port) {
   return new Promise((resolve, reject) => {
@@ -280,22 +416,36 @@ function fetchCdpTargetsJson(port) {
   });
 }
 
-// 实时读取 Antigravity Electron 主窗口 page 路由 (/c/<convId>?section=<projectId>)
-async function refreshFocusedWindowRoute(force = false) {
+// 实时读取指定实例 Antigravity Electron 窗口 page 路由 (/c/<convId>?section=<projectId>)
+async function refreshFocusedWindowRoute(force = false, instanceCtx = null) {
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(PORT);
+  const instKey = ctx.instanceId || "main";
   const now = Date.now();
-  if (!force && latestWindowRoute.updatedAt > 0 && (now - latestWindowRoute.updatedAt < 250)) {
-    return latestWindowRoute;
-  }
-  if (inflightRoutePromise) return inflightRoutePromise;
+  const prevRoute = routeCacheByInstance.get(instKey) || {
+    instanceId: instKey,
+    projectId: "",
+    convId: "",
+    sectionProjId: "",
+    rawUrl: "",
+    title: "",
+    port: 0,
+    updatedAt: 0
+  };
 
-  inflightRoutePromise = (async () => {
-    let port = discoverElectronCdpPort(false);
+  if (!force && prevRoute.updatedAt > 0 && (now - prevRoute.updatedAt < 250)) {
+    return prevRoute;
+  }
+  if (inflightRouteByInstance.has(instKey)) {
+    return inflightRouteByInstance.get(instKey);
+  }
+
+  const p = (async () => {
+    let port = discoverElectronCdpPort(false, ctx);
     let targets = null;
     try {
       targets = await fetchCdpTargetsJson(port);
     } catch (e) {
-      // 若缓存端口失效（如客户端重启换了新随机端口），强制重读 DevToolsActivePort 重试一次
-      const freshPort = discoverElectronCdpPort(true);
+      const freshPort = discoverElectronCdpPort(true, ctx);
       if (freshPort !== port) {
         port = freshPort;
         try {
@@ -309,16 +459,15 @@ async function refreshFocusedWindowRoute(force = false) {
         t &&
         t.type === "page" &&
         typeof t.url === "string" &&
-        (t.url.includes("/c/") || t.url.includes("section=") || (t.title || "").includes("Antigravity"))
+        (t.url.includes("/c/") || t.url.includes("section=") || t.url.includes("project=") || (t.title || "").includes("Antigravity"))
       );
       if (pageTarget && pageTarget.url) {
         const rawUrl = pageTarget.url;
         const convMatch = rawUrl.match(/\/c\/([0-9a-f-]{36})/i);
-        const secMatch = rawUrl.match(/[?&]section=([0-9a-f-]{36})/i);
+        const secMatch = rawUrl.match(/[?&](?:section|project)=([0-9a-f-]{36})/i);
         const convId = convMatch ? convMatch[1] : "";
         const sectionProjId = secMatch ? secMatch[1] : "";
 
-        // 先查 SQLite 确认会话归属；若为尚未落库的新会话/纯聊天会话，则直接用路由中的 ?section=<projectId> 注入内存缓存，0ms 免拉起子进程
         let dbProjId = "";
         if (convId && sqliteDb) {
           try {
@@ -335,7 +484,8 @@ async function refreshFocusedWindowRoute(force = false) {
         }
 
         const resolvedProjectId = sectionProjId || dbProjId || (convId ? resolveProjectIdFromDb(convId) : "");
-        latestWindowRoute = {
+        const nextRoute = {
+          instanceId: instKey,
           projectId: resolvedProjectId || "",
           convId,
           sectionProjId,
@@ -344,22 +494,36 @@ async function refreshFocusedWindowRoute(force = false) {
           port,
           updatedAt: Date.now()
         };
+        routeCacheByInstance.set(instKey, nextRoute);
+        return nextRoute;
       }
     }
-    return latestWindowRoute;
+    return prevRoute;
   })().finally(() => {
-    inflightRoutePromise = null;
+    inflightRouteByInstance.delete(instKey);
   });
 
-  return inflightRoutePromise;
+  inflightRouteByInstance.set(instKey, p);
+  return p;
 }
 
-function getFocusedWindowRoute() {
-  return latestWindowRoute;
+function getFocusedWindowRoute(instanceCtx = null) {
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(PORT);
+  const instKey = ctx.instanceId || "main";
+  return routeCacheByInstance.get(instKey) || {
+    instanceId: instKey,
+    projectId: "",
+    convId: "",
+    sectionProjId: "",
+    rawUrl: "",
+    title: "",
+    port: 0,
+    updatedAt: 0
+  };
 }
 
-// 启动时立即探测一次主窗口路由
-refreshFocusedWindowRoute(true).catch(() => {});
+// 启动时立即探测一次当前实例窗口路由
+refreshFocusedWindowRoute(true, resolveSwitcherInstanceContext(PORT)).catch(() => {});
 
 const lastValidJsonCache = new Map();
 const PROFILES_BAK_FILE = `${PROFILES_FILE}.bak`;
@@ -495,33 +659,77 @@ function resolvePluginLogoUrl(dir, manifest = {}) {
 let lastInternalConfigWriteMs = 0;
 let inflightLsRpcCount = 0;
 let lastLsRpcDoneMs = 0;
-let cachedLsRpcTarget = null;
-let cachedLsRpcTargetAt = 0;
+const lsRpcTargetByInstance = new Map();
 
-function resolveLsRpcTarget(profilesHint = null) {
-  const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "";
-  const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
-  if (envAddr && envCsrf) {
-    const [hostname, portStr] = envAddr.split(":");
-    const port = Number(portStr || 5387);
-    if (hostname && port > 0) {
-      cachedLsRpcTarget = { hostname, port, csrf: envCsrf };
-      cachedLsRpcTargetAt = Date.now();
-      return cachedLsRpcTarget;
+function resolveLsRpcTarget(profilesHint = null, instanceCtx = null) {
+  const selfCtx = resolveSwitcherInstanceContext(PORT);
+  const ctx = instanceCtx || selfCtx;
+  const instKey = ctx.instanceId || "main";
+
+  // 若查询的正是当前 Sidecar 宿主所属实例，优先使用宿主注入的环境变量
+  if (instKey === selfCtx.instanceId) {
+    const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS || "";
+    const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
+    if (envAddr && envCsrf) {
+      const [hostname, portStr] = envAddr.split(":");
+      const port = Number(portStr || 5387);
+      if (hostname && port > 0) {
+        const target = { hostname, port, csrf: envCsrf };
+        lsRpcTargetByInstance.set(instKey, { target, at: Date.now() });
+        return target;
+      }
     }
   }
-  if (cachedLsRpcTarget && (Date.now() - cachedLsRpcTargetAt < 30000)) {
-    return cachedLsRpcTarget;
+
+  const cached = lsRpcTargetByInstance.get(instKey);
+  if (cached && (Date.now() - cached.at < 30000)) {
+    return cached.target;
   }
-  const metaTarget = profilesHint?.__meta__?.lsRpcTarget;
-  if (metaTarget && metaTarget.port && metaTarget.csrf) {
-    cachedLsRpcTarget = {
-      hostname: metaTarget.hostname || "127.0.0.1",
-      port: Number(metaTarget.port),
-      csrf: String(metaTarget.csrf)
+
+  const instMetaTarget = profilesHint?.__meta__?.instances?.[instKey]?.lsRpcTarget;
+  if (instMetaTarget && instMetaTarget.port && instMetaTarget.csrf) {
+    const target = {
+      hostname: instMetaTarget.hostname || "127.0.0.1",
+      port: Number(instMetaTarget.port),
+      csrf: String(instMetaTarget.csrf)
     };
-    cachedLsRpcTargetAt = Date.now();
-    return cachedLsRpcTarget;
+    lsRpcTargetByInstance.set(instKey, { target, at: Date.now() });
+    return target;
+  }
+
+  // 兜底：从 antigravity-relay 的共享配置中读取该实例已发现的 lsRpcTarget（含 csrf 与 http 端口）
+  try {
+    const relayCfgPath = path.join(PLUGINS_DIR, "antigravity-relay", "data", "agy-relay-config.json");
+    if (fs.existsSync(relayCfgPath)) {
+      const relayCfg = JSON.parse(fs.readFileSync(relayCfgPath, "utf-8"));
+      const relayTarget = relayCfg?.__meta__?.instances?.[instKey]?.lsRpcTarget || (!ctx.isIsolatedInstance ? relayCfg?.__meta__?.lsRpcTarget : null);
+      if (relayTarget && relayTarget.csrf) {
+        const { httpPort } = extractActiveSegmentFromLsLog(ctx.lsLogFile);
+        const port = Number(httpPort || (relayTarget.protocol === "http" ? relayTarget.port : relayTarget.altPort) || relayTarget.port || 0);
+        if (port > 0) {
+          const target = {
+            hostname: relayTarget.hostname || "127.0.0.1",
+            port,
+            csrf: String(relayTarget.csrf)
+          };
+          lsRpcTargetByInstance.set(instKey, { target, at: Date.now() });
+          return target;
+        }
+      }
+    }
+  } catch (e) {}
+
+  if (!ctx.isIsolatedInstance) {
+    const metaTarget = profilesHint?.__meta__?.lsRpcTarget;
+    if (metaTarget && metaTarget.port && metaTarget.csrf) {
+      const target = {
+        hostname: metaTarget.hostname || "127.0.0.1",
+        port: Number(metaTarget.port),
+        csrf: String(metaTarget.csrf)
+      };
+      lsRpcTargetByInstance.set(instKey, { target, at: Date.now() });
+      return target;
+    }
   }
   return null;
 }
@@ -537,28 +745,48 @@ function extractConfigPluginSnapshot(config) {
   return snap;
 }
 
-function recordConfigWriteMeta(profiles, config, appliedProjectId = "", didWriteConfigFile = true) {
+function recordConfigWriteMeta(profiles, config, appliedProjectId = "", didWriteConfigFile = true, instanceCtx = null) {
   if (!profiles || typeof profiles !== "object") return;
   if (!profiles.__meta__) profiles.__meta__ = {};
+  if (!profiles.__meta__.instances || typeof profiles.__meta__.instances !== "object") {
+    profiles.__meta__.instances = {};
+  }
+  const ctx = instanceCtx || resolveSwitcherInstanceContext(PORT);
+  const instKey = ctx.instanceId || "main";
+  if (!profiles.__meta__.instances[instKey] || typeof profiles.__meta__.instances[instKey] !== "object") {
+    profiles.__meta__.instances[instKey] = {};
+  }
+  const instMeta = profiles.__meta__.instances[instKey];
+
   const now = Date.now();
   if (didWriteConfigFile) {
     lastInternalConfigWriteMs = now;
     profiles.__meta__.lastInternalConfigWriteAt = now;
+    instMeta.lastInternalConfigWriteAt = now;
   }
-  profiles.__meta__.lastAppliedConfigSnapshot = extractConfigPluginSnapshot(config);
-  if (appliedProjectId && appliedProjectId !== DEFAULT_KEY) {
-    profiles.__meta__.lastAppliedProjectId = appliedProjectId;
-  } else if (profiles.__meta__.lastActiveProjectId) {
-    profiles.__meta__.lastAppliedProjectId = profiles.__meta__.lastActiveProjectId;
+  const snap = extractConfigPluginSnapshot(config);
+  profiles.__meta__.lastAppliedConfigSnapshot = snap;
+  instMeta.lastAppliedConfigSnapshot = snap;
+
+  const effectiveProjId = (appliedProjectId && appliedProjectId !== DEFAULT_KEY)
+    ? appliedProjectId
+    : (instMeta.lastActiveProjectId || profiles.__meta__.lastActiveProjectId || "");
+  if (effectiveProjId) {
+    profiles.__meta__.lastAppliedProjectId = effectiveProjId;
+    instMeta.lastAppliedProjectId = effectiveProjId;
   }
-  const target = resolveLsRpcTarget(profiles);
+  const target = resolveLsRpcTarget(profiles, ctx);
   if (target) {
-    profiles.__meta__.lsRpcTarget = {
+    const rpcObj = {
       hostname: target.hostname,
       port: target.port,
       csrf: target.csrf,
       updatedAt: now
     };
+    instMeta.lsRpcTarget = rpcObj;
+    if (!ctx.isIsolatedInstance) {
+      profiles.__meta__.lsRpcTarget = rpcObj;
+    }
   }
 }
 
@@ -616,10 +844,8 @@ function writeJsonSafe(filePath, data) {
   }
 }
 
-function notifyLanguageServer(pluginUpdates, profilesHint = null) {
-  const target = resolveLsRpcTarget(profilesHint);
-  if (!target || !target.csrf) return;
-
+function sendJetboxWriteStateToTarget(target, pluginUpdates) {
+  if (!target || !target.csrf || !target.port) return;
   try {
     inflightLsRpcCount++;
     let settled = false;
@@ -630,7 +856,7 @@ function notifyLanguageServer(pluginUpdates, profilesHint = null) {
       lastLsRpcDoneMs = Date.now();
     };
     const req = http.request({
-      hostname: target.hostname,
+      hostname: target.hostname || "127.0.0.1",
       port: Number(target.port || 5387),
       path: "/exa.language_server_pb.LanguageServerService/JetboxWriteState",
       method: "POST",
@@ -653,6 +879,40 @@ function notifyLanguageServer(pluginUpdates, profilesHint = null) {
   } catch (e) {}
 }
 
+function notifyLanguageServer(pluginUpdates, profilesHint = null, instanceCtx = null) {
+  const target = resolveLsRpcTarget(profilesHint, instanceCtx);
+  sendJetboxWriteStateToTarget(target, pluginUpdates);
+}
+
+// 当某个项目的配置被修改时，同步通知所有正处于该项目下的实例 Language Server（实现跨实例实时生效）
+function notifyMatchingInstancesLanguageServers(projectIds, pluginUpdates, profilesHint = null, currentCtx = null, currentActiveId = "") {
+  const idSet = new Set(Array.isArray(projectIds) ? projectIds : [projectIds]);
+  const sentPorts = new Set();
+  const ctx = currentCtx || resolveSwitcherInstanceContext(PORT);
+
+  if (currentActiveId && idSet.has(currentActiveId)) {
+    const t = resolveLsRpcTarget(profilesHint, ctx);
+    if (t && t.port) {
+      sentPorts.add(Number(t.port));
+      sendJetboxWriteStateToTarget(t, pluginUpdates);
+    }
+  }
+
+  const allInstances = listAllSwitcherInstances();
+  for (const cand of allInstances) {
+    const instMeta = profilesHint?.__meta__?.instances?.[cand.instanceId];
+    const route = getFocusedWindowRoute(cand);
+    const activeIdForCand = (route && route.projectId) || instMeta?.lastActiveProjectId || "";
+    if (activeIdForCand && idSet.has(activeIdForCand)) {
+      const t = resolveLsRpcTarget(profilesHint, cand);
+      if (t && t.port && !sentPorts.has(Number(t.port))) {
+        sentPorts.add(Number(t.port));
+        sendJetboxWriteStateToTarget(t, pluginUpdates);
+      }
+    }
+  }
+}
+
 export function getLastInternalConfigWriteMs() {
   return Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs);
 }
@@ -662,118 +922,23 @@ export function isInternalConfigWriteSettled(minSettleMs = 450) {
   return (Date.now() - Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs)) > minSettleMs;
 }
 
-export function syncNativeSettingsFromLsMemory(expectedProjectId = "") {
-  const target = resolveLsRpcTarget();
-  if (!target || !target.csrf || !isInternalConfigWriteSettled(600)) {
-    return Promise.resolve(false);
-  }
-
-  return new Promise((resolve) => {
-    try {
-      const req = http.request({
-        hostname: target.hostname,
-        port: Number(target.port || 5387),
-        path: "/exa.language_server_pb.LanguageServerService/GetAllPlugins",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-codeium-csrf-token": target.csrf
-        },
-        timeout: 450
-      }, (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          return resolve(false);
-        }
-        let body = "";
-        res.setEncoding("utf-8");
-        res.on("data", (chunk) => { body += chunk; });
-        res.on("end", () => {
-          try {
-            if (!isInternalConfigWriteSettled(600)) return resolve(false);
-            const data = JSON.parse(body);
-            const list = data?.plugins || data?.pluginInfos || data?.items || [];
-            if (!Array.isArray(list) || list.length === 0) return resolve(false);
-
-            const profiles = readJsonSafe(PROFILES_FILE, {});
-            const lastActiveId = profiles?.__meta__?.lastActiveProjectId || "";
-            if (!lastActiveId || lastActiveId === DEFAULT_KEY || !profiles[lastActiveId] || !profiles[lastActiveId].plugins) return resolve(false);
-            if (expectedProjectId && expectedProjectId !== lastActiveId) return resolve(false);
-            if (profiles?.__meta__?.lastAppliedProjectId && profiles.__meta__.lastAppliedProjectId !== lastActiveId) return resolve(false);
-
-            const nowMs = Date.now();
-            const lastProfileWriteAt = Number(profiles?.__meta__?.lastInternalConfigWriteAt || 0);
-            const lastSwitchAt = Number(profiles?.__meta__?.lastProjectSwitchAt || 0);
-            const lastBgHookAt = Number(profiles?.__meta__?.lastBgHookAt || 0);
-            if (nowMs - lastProfileWriteAt <= 1200 || nowMs - lastSwitchAt <= 2000 || nowMs - lastBgHookAt <= 2000) {
-              return resolve(false);
-            }
-
-            const snap = profiles?.__meta__?.lastAppliedConfigSnapshot || null;
-            if (!snap) return resolve(false);
-            const config = readJsonSafe(CONFIG_FILE, { plugins: {} });
-            if (!config.plugins) config.plugins = {};
-            const activeProfile = profiles[lastActiveId];
-            let changed = false;
-
-            for (const item of list) {
-              const rawKey = item?.id || item?.name || item?.pluginId || item?.directory || "";
-              const dir = String(rawKey).split("@")[0].trim();
-              if (!dir || PROTECTED_PLUGINS.has(dir) || !isValidPluginDirectory(dir)) continue;
-              const enabledInLs = typeof item?.userConfig?.enabled === "boolean"
-                ? item.userConfig.enabled
-                : (typeof item?.disabled === "boolean" ? !item.disabled : item?.enabled);
-              if (typeof enabledInLs !== "boolean") continue;
-              if (snap[dir] === undefined) continue;
-              const profileVal = Boolean(activeProfile.plugins[dir]);
-              const configVal = Boolean(config.plugins?.[dir]?.enabled !== false);
-              // 仅当基准快照、config.json 与当前项目 Profile 三者完全一致（确认为同项目稳定基线），且 LS 内存值偏离该基线时，才认定为用户在原生 Settings 中手动拨动了开关
-              if (Boolean(snap[dir]) !== profileVal || configVal !== profileVal) continue;
-              if (enabledInLs !== profileVal) {
-                activeProfile.plugins[dir] = enabledInLs;
-                if (!config.plugins[dir]) config.plugins[dir] = {};
-                config.plugins[dir].enabled = enabledInLs;
-                changed = true;
-              }
-            }
-
-            if (changed) {
-              recordConfigWriteMeta(profiles, config, lastActiveId);
-              writeJsonSafe(PROFILES_FILE, profiles);
-              writeJsonSafe(CONFIG_FILE, config);
-              return resolve(true);
-            }
-            resolve(false);
-          } catch (err) {
-            resolve(false);
-          }
-        });
-      });
-      req.on("timeout", () => {
-        req.destroy();
-        resolve(false);
-      });
-      req.on("error", () => resolve(false));
-      req.write("{}");
-      req.end();
-    } catch (e) {
-      resolve(false);
-    }
-  });
-}
-
 export {
   PLUGINS_DIR,
   CONFIG_FILE,
   PROFILES_FILE,
   PROFILES_BAK_FILE,
   PROJECTS_DIR,
+  MAIN_USER_DATA_DIR,
+  INSTANCES_ROOT_DIR,
   APP_STORAGE_FILE,
   DEVTOOLS_ACTIVE_PORT_FILE,
   CONV_DB_PATH,
   PROTECTED_PLUGINS,
   DEFAULT_KEY,
   PRELOAD_SDK_PATH,
+  listAllSwitcherInstances,
+  resolveSwitcherInstanceContext,
+  resolveLsRpcTarget,
   isValidPluginDirectory,
   resolveProjectIdFromDb,
   getLatestActiveProjectIdFromDb,
@@ -787,5 +952,6 @@ export {
   extractConfigPluginSnapshot,
   recordConfigWriteMeta,
   writeJsonSafe,
-  notifyLanguageServer
+  notifyLanguageServer,
+  notifyMatchingInstancesLanguageServers
 };

@@ -31,7 +31,7 @@
 - <b>Chat Session Smart Isolation</b>: Detect directory-free chat sessions automatically and inhibit heavy development plugins to maximize response speed and prompt signal-to-noise ratio.
 - <b>Inline Batch Editing</b>: Open batch edit mode directly inside the project selector dropdown. Support select all and multi-target selection to sync plugin toggles across multiple projects simultaneously.
 - <b>Dual-Way Live Sync</b>: Seamlessly connect the Antigravity host native Settings and the Sidecar panel, synchronizing toggle states in real time regardless of where the modification occurs.
-- <b>Standalone Window Mode</b>: Built-in fixed port 8088 web server allows direct control via an independent desktop app window, fully compatible with GCP remote login environments.
+- <b>Multi-Instance Clone Ports & Shared Profiles</b>: Built-in dual clone ports 8088 (main instance) and 8098 (isolated instance) share a single backend profile database (saving changes in one instance syncs to the other in milliseconds) while independently tracking each instance's active project.
 - <b>Bilingual Support and Theme Adaptation</b>: Automatically matches browser language preference on first load, native English and Chinese runtime localization with persistent storage, matching the host dark and light color systems automatically.
 
 ---

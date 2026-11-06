@@ -4,10 +4,65 @@ const path = require("path");
 const http = require("http");
 const os = require("os");
 
-const homeDir = os.homedir();
-const appDataDir = process.env.APPDATA || (process.platform === "darwin" ? path.join(homeDir, "Library", "Application Support") : path.join(homeDir, ".config"));
-const APP_STORAGE_FILE = path.join(appDataDir, "Antigravity", "app_storage.json");
-const DEVTOOLS_ACTIVE_PORT_FILE = path.join(appDataDir, "Antigravity", "DevToolsActivePort");
+function resolveHostHomeDir() {
+  const realEnv = String(process.env.AGY_REAL_USERPROFILE || "").trim();
+  if (realEnv && fs.existsSync(realEnv)) return path.normalize(realEnv);
+  const normalized = __dirname.replace(/\\/g, "/");
+  const geminiIdx = normalized.toLowerCase().lastIndexOf("/.gemini/");
+  if (geminiIdx > 0) {
+    const candidate = path.normalize(__dirname.slice(0, geminiIdx));
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return os.homedir();
+}
+
+const homeDir = resolveHostHomeDir();
+const appDataDir = (process.platform === "win32" && fs.existsSync(path.join(homeDir, "AppData", "Roaming")))
+  ? path.join(homeDir, "AppData", "Roaming")
+  : (process.env.APPDATA || (process.platform === "darwin" ? path.join(homeDir, "Library", "Application Support") : path.join(homeDir, ".config")));
+const MAIN_USER_DATA_DIR = path.join(appDataDir, "Antigravity");
+const INSTANCES_ROOT_DIR = path.join(homeDir, ".gemini", "antigravity-instances");
+
+function resolveCurrentHookInstanceContext() {
+  const envDir = String(process.env.AGY_RELAY_INSTANCE_USER_DATA_DIR || "").trim();
+  const envId = String(process.env.AGY_RELAY_INSTANCE_ID || "").trim();
+  if (envDir && fs.existsSync(envDir)) {
+    const id = envId || path.basename(envDir);
+    return {
+      instanceId: id,
+      isIsolatedInstance: id !== "main",
+      userDataDir: envDir,
+      appStorageFile: path.join(envDir, "app_storage.json"),
+      devToolsActivePortFile: path.join(envDir, "DevToolsActivePort")
+    };
+  }
+  const rawHome = String(process.env.USERPROFILE || process.env.HOME || os.homedir() || "").replace(/\\/g, "/");
+  const isoMatch = rawHome.match(/antigravity-instances\/([^/]+)/i);
+  if (isoMatch && isoMatch[1]) {
+    const id = isoMatch[1].trim();
+    const isoDir = path.join(INSTANCES_ROOT_DIR, id);
+    if (fs.existsSync(isoDir)) {
+      return {
+        instanceId: id,
+        isIsolatedInstance: true,
+        userDataDir: isoDir,
+        appStorageFile: path.join(isoDir, "app_storage.json"),
+        devToolsActivePortFile: path.join(isoDir, "DevToolsActivePort")
+      };
+    }
+  }
+  return {
+    instanceId: "main",
+    isIsolatedInstance: false,
+    userDataDir: MAIN_USER_DATA_DIR,
+    appStorageFile: path.join(MAIN_USER_DATA_DIR, "app_storage.json"),
+    devToolsActivePortFile: path.join(MAIN_USER_DATA_DIR, "DevToolsActivePort")
+  };
+}
+
+const currentInstanceCtx = resolveCurrentHookInstanceContext();
+const APP_STORAGE_FILE = currentInstanceCtx.appStorageFile;
+const DEVTOOLS_ACTIVE_PORT_FILE = currentInstanceCtx.devToolsActivePortFile;
 const CONV_DB_PATH = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
 const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
 const profilesBakPath = `${profilesPath}.bak`;
@@ -208,11 +263,11 @@ function getFocusedWindowRouteCdp(convDbPath, profilesMeta) {
             if (!Array.isArray(targets)) return resolve(null);
             const page = targets.find((t) =>
               t && t.type === "page" && typeof t.url === "string" &&
-              (t.url.includes("/c/") || t.url.includes("section=") || (t.title || "").includes("Antigravity"))
+              (t.url.includes("/c/") || t.url.includes("section=") || t.url.includes("project=") || (t.title || "").includes("Antigravity"))
             );
             if (!page || !page.url) return resolve(null);
             const convMatch = page.url.match(/\/c\/([0-9a-f-]{36})/i);
-            const secMatch = page.url.match(/[?&]section=([0-9a-f-]{36})/i);
+            const secMatch = page.url.match(/[?&](?:section|project)=([0-9a-f-]{36})/i);
             const convId = convMatch ? convMatch[1] : "";
             const sectionProjId = secMatch ? secMatch[1] : "";
             const projId =
@@ -460,7 +515,15 @@ async function main() {
     }
     if (!configObj.plugins) configObj.plugins = {};
 
-    const lastActiveId = profiles.__meta__.lastActiveProjectId || "";
+    const instKey = currentInstanceCtx.instanceId || "main";
+    if (!profiles.__meta__.instances || typeof profiles.__meta__.instances !== "object") {
+      profiles.__meta__.instances = {};
+    }
+    if (!profiles.__meta__.instances[instKey] || typeof profiles.__meta__.instances[instKey] !== "object") {
+      profiles.__meta__.instances[instKey] = {};
+    }
+    const instMeta = profiles.__meta__.instances[instKey];
+    const lastActiveId = instMeta.lastActiveProjectId || profiles.__meta__.lastActiveProjectId || "";
     let metaChanged = false;
 
     if (payloadConvId && profiles.__meta__.convProjectMap[payloadConvId] !== activeProjectId) {
@@ -474,9 +537,7 @@ async function main() {
       metaChanged = true;
     }
 
-    // 检测当前触发 Hook 的会话是否为「后台运行对话」（前台已切换到其他项目）
-    // 核心铁律：宿主切换项目/历史对话仅改 Electron 内存路由而不更新磁盘 app_storage.json，且面板关闭时 lastSidecarProjectId 会停留在旧值；
-    // 因此优先直读 DevToolsActivePort 主窗口实时内存路由（< 1ms）作为前后台裁决唯一真源！
+    // 检测当前触发 Hook 的会话是否为当前实例窗口的「后台运行对话」（优先直读当前实例自身的 DevToolsActivePort 实时内存路由）
     const liveRoute = await getFocusedWindowRouteCdp(CONV_DB_PATH, profiles.__meta__);
     let isBackgroundConv = false;
 
@@ -489,9 +550,8 @@ async function main() {
         isBackgroundConv = false;
       }
     } else {
-      // 仅当 CDP 端口不可达时，才使用带 8 秒新鲜度校验的 Sidecar 轮询标记兜底（严禁使用未校验时间戳的陈旧 lastSidecarConvId 或不写盘的 storageHeadConvId）
-      const foregroundSidecarProjId = profiles.__meta__.lastSidecarProjectId || "";
-      const lastSidecarPollAt = Number(profiles.__meta__.lastSidecarPollAt || 0);
+      const foregroundSidecarProjId = instMeta.lastSidecarProjectId || (!currentInstanceCtx.isIsolatedInstance ? profiles.__meta__.lastSidecarProjectId : "") || "";
+      const lastSidecarPollAt = Number(instMeta.lastSidecarPollAt || (!currentInstanceCtx.isIsolatedInstance ? profiles.__meta__.lastSidecarPollAt : 0) || 0);
       isBackgroundConv = Boolean(
         foregroundSidecarProjId &&
         foregroundSidecarProjId !== activeProjectId &&
@@ -499,7 +559,7 @@ async function main() {
       );
     }
 
-    // 若为后台对话调用（无论 pre-tool 还是 pre-invocation），当宿主主窗口正聚焦在其他项目时，绝对不篡改前台活跃项目 ID 与全局 config.json，防止把前台项目插件偷偷关掉
+    // 若为当前实例的后台对话调用，绝不篡改当前实例前台活跃项目 ID 与全局 config.json
     if (isBackgroundConv) {
       if (metaChanged) {
         writeJsonAtomic(profilesPath, profiles, profilesBakPath);
@@ -508,7 +568,6 @@ async function main() {
     }
 
     // 无论 lastActiveId 是否等于 activeProjectId，Hook 一律以 matchedProfile.plugins 为唯一权威真源正向校验 config.json
-    // 绝不在 Hook 中用 config.json 反向覆盖 matchedProfile.plugins，彻底杜绝前后台切换时相互污染 Profile！
     let hasDiff = false;
     const rpcUpdates = {};
 
@@ -527,35 +586,42 @@ async function main() {
       }
     }
 
-    if (lastActiveId !== activeProjectId || hasDiff) {
+    if (lastActiveId !== activeProjectId || instMeta.lastAppliedProjectId !== activeProjectId || hasDiff) {
       const nowMs = Date.now();
       if (activeProjectId && activeProjectId !== DEFAULT_KEY) {
         if (lastActiveId !== activeProjectId) {
           profiles.__meta__.lastProjectSwitchAt = nowMs;
+          instMeta.lastProjectSwitchAt = nowMs;
         }
         profiles.__meta__.lastActiveProjectId = activeProjectId;
         profiles.__meta__.lastAppliedProjectId = activeProjectId;
+        instMeta.lastActiveProjectId = activeProjectId;
+        instMeta.lastAppliedProjectId = activeProjectId;
       }
       profiles.__meta__.lastBgHookAt = nowMs;
       profiles.__meta__.lastInternalConfigWriteAt = nowMs;
+      instMeta.lastInternalConfigWriteAt = nowMs;
       const snap = {};
       for (const [k, v] of Object.entries(configObj.plugins || {})) {
         if (k.startsWith(".") || PROTECTED_PLUGINS.has(k)) continue;
         snap[k] = Boolean(!v || v.enabled !== false);
       }
       profiles.__meta__.lastAppliedConfigSnapshot = snap;
+      instMeta.lastAppliedConfigSnapshot = snap;
       metaChanged = true;
     }
 
-    // 必须先写 profiles.json（锁定时间戳与新快照），再写 config.json，防止 Sidecar 的 fs.watch 读到旧快照产生反向误判！
+    // 必须先写 profiles.json（锁定时间戳与新快照），再写 config.json
     if (metaChanged) {
       writeJsonAtomic(profilesPath, profiles, profilesBakPath);
     }
 
-    if (hasDiff) {
-      writeJsonAtomic(configPath, configObj);
+    if (hasDiff || instMeta.lastAppliedProjectId === activeProjectId) {
+      if (hasDiff) {
+        writeJsonAtomic(configPath, configObj);
+      }
 
-      const savedTarget = profiles.__meta__.lsRpcTarget || {};
+      const savedTarget = instMeta.lsRpcTarget || (!currentInstanceCtx.isIsolatedInstance ? profiles.__meta__.lsRpcTarget : null) || {};
       const lsAddr = process.env.ANTIGRAVITY_LS_ADDRESS || (savedTarget.port ? `${savedTarget.hostname || "127.0.0.1"}:${savedTarget.port}` : "localhost:5387");
       const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || savedTarget.csrf || "";
 

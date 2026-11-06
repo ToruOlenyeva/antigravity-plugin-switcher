@@ -17,7 +17,7 @@
     let resetConfirmTimer = null;
     let isViewportIntersecting = true;
     const clientInstanceId = "cid_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
-    const isEmbeddedSidecar = typeof window !== "undefined" && window.location.port !== "8088" && Boolean(
+    const isEmbeddedSidecar = typeof window !== "undefined" && window.location.port !== "8088" && window.location.port !== "8098" && Boolean(
       window.sidecar ||
       new URLSearchParams(window.location.search).get("token")
     );
@@ -1064,26 +1064,27 @@
           showToast(I18N[currentLang].toastAutoApplied);
         }
       } else if (!isBatchMode) {
-        // 核心双向感知：当宿主未切换项目，但在另一端面板或原生设置中拨动了开关时，实时同步更新当前选中项目开关
+        // 核心双向感知：当宿主未切换项目，但在另一实例面板或原生设置中修改并保存了任意项目配置时，实时同步更新当前选中项目开关
         let hasDiff = false;
-        if (currentSelectedId === latestState.activeProjectId) {
+        const selectedProfPlugins = (latestState.profiles && latestState.profiles[currentSelectedId] && latestState.profiles[currentSelectedId].plugins) || null;
+        if (selectedProfPlugins) {
+          for (const p of (latestState.plugins || [])) {
+            const targetVal = p.protected ? true : (selectedProfPlugins[p.dir] !== undefined ? Boolean(selectedProfPlugins[p.dir]) : p.enabled);
+            if (localEditedPlugins[p.dir] !== targetVal) {
+              hasDiff = true;
+              localEditedPlugins[p.dir] = targetVal;
+            }
+          }
+        } else if (currentSelectedId === latestState.activeProjectId) {
           for (const p of (latestState.plugins || [])) {
             if (localEditedPlugins[p.dir] !== p.enabled) {
               hasDiff = true;
               localEditedPlugins[p.dir] = p.enabled;
             }
           }
-        } else if (latestState.profiles && latestState.profiles[currentSelectedId] && latestState.profiles[currentSelectedId].plugins) {
-          const profPlugins = latestState.profiles[currentSelectedId].plugins;
-          for (const p of (latestState.plugins || [])) {
-            const targetVal = p.protected ? true : (profPlugins[p.dir] !== undefined ? Boolean(profPlugins[p.dir]) : p.enabled);
-            if (localEditedPlugins[p.dir] !== targetVal) {
-              hasDiff = true;
-              localEditedPlugins[p.dir] = targetVal;
-            }
-          }
         }
         if (hasDiff) {
+          renderCustomDropdownMenu();
           updateResetBtnVisibility();
           updateStatusNote();
           renderPluginCards();
