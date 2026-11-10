@@ -39,7 +39,15 @@ function scanAntigravityProjects(instanceCtx = null) {
     orderArray = JSON.parse(appStorage.projectsOrder || "[]");
   } catch (e) {}
 
-  // 2. 读取 projects 目录下全部项目配置
+  // 2. 读取 projects 目录下全部项目配置（自动过滤并清理伴生 Sidecar 空壳伪项目）
+  const rawConfigForSidecars = readJsonSafe(CONFIG_FILE, {}) || {};
+  const sidecarProjIds = new Set();
+  if (rawConfigForSidecars && rawConfigForSidecars.sidecars && typeof rawConfigForSidecars.sidecars === "object") {
+    for (const sc of Object.values(rawConfigForSidecars.sidecars)) {
+      if (sc && sc.projectId) sidecarProjIds.add(sc.projectId);
+    }
+  }
+
   try {
     const files = fs.readdirSync(PROJECTS_DIR);
     for (const f of files) {
@@ -52,6 +60,11 @@ function scanAntigravityProjects(instanceCtx = null) {
 
       const id = data.id;
       const name = data.name || id;
+      const isGhost = sidecarProjIds.has(id) || (typeof name === "string" && (name.startsWith("plugin-") || name.includes("/sidecars/") || name.includes("/panel") || name.includes("/")));
+      if (isGhost) {
+        try { fs.unlinkSync(fullPath); } catch (e) {}
+        continue;
+      }
       const paths = [];
 
       const resources = (data.projectResources && data.projectResources.resources) || [];
@@ -257,7 +270,9 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
 
   // 第一权威源：当前实例 Antigravity Electron 窗口实时路由 (/c/<convId>?section=<projectId> 或 /c/<convId>)
   const windowRoute = getFocusedWindowRoute(ctx);
-  if (windowRoute && (windowRoute.projectId || windowRoute.convId) && (Date.now() - windowRoute.updatedAt < 10000)) {
+  const isRouteFresh = Boolean(windowRoute && (Date.now() - windowRoute.updatedAt < 10000));
+  const isWindowOnWelcome = Boolean(isRouteFresh && windowRoute.rawUrl && !windowRoute.convId && !windowRoute.projectId);
+  if (isRouteFresh && (windowRoute.projectId || windowRoute.convId)) {
     const resolvedRouteProjId =
       windowRoute.projectId ||
       (windowRoute.convId && meta.convProjectMap && meta.convProjectMap[windowRoute.convId]) ||
@@ -290,24 +305,33 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
       const activeWorkspace = (found.primaryPath || clientWorkspaceUri || "").replace(/\\/g, "/");
       return {
         activeProjectId: clientProjectId,
-        effectiveConvId: convId || lastIdeContext.effectiveConvId,
+        effectiveConvId: isWindowOnWelcome ? "" : (convId || lastIdeContext.effectiveConvId),
         activeWorkspace,
-        isNewConvoContext: !convId,
+        isNewConvoContext: isWindowOnWelcome || !convId,
         source: "explicit-project-id"
       };
     }
   }
 
-  // 优先级 3：CDP 端口不可达时的按实例轻量兜底
+  // 优先级 3：欢迎页准备态或 CDP 端口不可达时的按实例协同兜底
   const appStorage = readJsonSafe(ctx.appStorageFile || APP_STORAGE_FILE, {});
-  if (!convId && token) {
+  let tokenNewConvoProjId = "";
+  if (token) {
     const tokenRes = resolveConvIdFromToken(token, appStorage);
-    if (tokenRes.convId) convId = tokenRes.convId;
+    if (!convId && tokenRes.convId && !isWindowOnWelcome) {
+      convId = tokenRes.convId;
+    }
+    if (tokenRes.newConvoProjId) {
+      tokenNewConvoProjId = tokenRes.newConvoProjId;
+    }
+  }
+  if (isWindowOnWelcome) {
+    convId = "";
   }
 
   let activeProjectId = "";
   if (convId) {
-    const dbId = resolveProjectIdFromDb(convId);
+    const dbId = resolveProjectIdFromDb(convId) || (meta.convProjectMap && meta.convProjectMap[convId]) || "";
     if (dbId && projects.some((p) => p.id === dbId)) {
       activeProjectId = dbId;
     }
@@ -315,23 +339,30 @@ function resolveCurrentActiveProjectId(params = {}, projects = [], profilesMeta 
   if (!activeProjectId && clientWorkspaceUri) {
     activeProjectId = findProjectIdByWorkspaceUris(clientWorkspaceUri, projects);
   }
+  if (!activeProjectId && tokenNewConvoProjId && projects.some((p) => p.id === tokenNewConvoProjId)) {
+    activeProjectId = tokenNewConvoProjId;
+  }
   if (!activeProjectId) {
-    const rawNewConvoProjId = typeof appStorage["new-convo-last-selected-project"] === "string"
-      ? appStorage["new-convo-last-selected-project"].trim().replace(/^"|"$/g, "")
-      : "";
-    if (rawNewConvoProjId && projects.some((p) => p.id === rawNewConvoProjId)) {
-      activeProjectId = rawNewConvoProjId;
-    } else if (lastIdeContext.activeProjectId && projects.some((p) => p.id === lastIdeContext.activeProjectId)) {
+    if (lastIdeContext.activeProjectId && projects.some((p) => p.id === lastIdeContext.activeProjectId)) {
       activeProjectId = lastIdeContext.activeProjectId;
+    } else if (instMeta.lastSidecarProjectId && projects.some((p) => p.id === instMeta.lastSidecarProjectId)) {
+      activeProjectId = instMeta.lastSidecarProjectId;
     } else if (instMeta.lastActiveProjectId && projects.some((p) => p.id === instMeta.lastActiveProjectId)) {
       activeProjectId = instMeta.lastActiveProjectId;
-    } else if (!ctx.isIsolatedInstance && meta.lastActiveProjectId && projects.some((p) => p.id === meta.lastActiveProjectId)) {
-      activeProjectId = meta.lastActiveProjectId;
+    } else {
+      const rawNewConvoProjId = typeof appStorage["new-convo-last-selected-project"] === "string"
+        ? appStorage["new-convo-last-selected-project"].trim().replace(/^"|"$/g, "")
+        : "";
+      if (rawNewConvoProjId && projects.some((p) => p.id === rawNewConvoProjId)) {
+        activeProjectId = rawNewConvoProjId;
+      } else if (!ctx.isIsolatedInstance && meta.lastActiveProjectId && projects.some((p) => p.id === meta.lastActiveProjectId)) {
+        activeProjectId = meta.lastActiveProjectId;
+      }
     }
   }
 
   const matchedProj = projects.find((p) => p.id === activeProjectId);
-  const effectiveConvId = convId || lastIdeContext.effectiveConvId || "";
+  const effectiveConvId = isWindowOnWelcome ? "" : (convId || lastIdeContext.effectiveConvId || "");
   const activeWorkspace = ((matchedProj && matchedProj.primaryPath) || clientWorkspaceUri || lastIdeContext.workspaceUri || "").replace(/\\/g, "/");
   return {
     activeProjectId,

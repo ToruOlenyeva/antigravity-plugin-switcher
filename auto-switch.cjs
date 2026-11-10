@@ -8,7 +8,7 @@ function resolveHostHomeDir() {
   const realEnv = String(process.env.AGY_REAL_USERPROFILE || "").trim();
   if (realEnv && fs.existsSync(realEnv)) return path.normalize(realEnv);
   const normalized = __dirname.replace(/\\/g, "/");
-  const geminiIdx = normalized.toLowerCase().lastIndexOf("/.gemini/");
+  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
   if (geminiIdx > 0) {
     const candidate = path.normalize(__dirname.slice(0, geminiIdx));
     if (fs.existsSync(candidate)) return candidate;

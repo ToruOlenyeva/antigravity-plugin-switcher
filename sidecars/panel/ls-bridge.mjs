@@ -10,8 +10,10 @@ const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT
 
 // 跨账户同源解析：优先从插件自身所在的物理路径向上反推宿主用户主目录（防止桌面登录非管理员账户 toru-work 而 Antigravity 以管理员 z9685 运行时 os.homedir() 错位）
 function resolveHostHomeDir() {
+  const realEnv = String(process.env.AGY_REAL_USERPROFILE || "").trim();
+  if (realEnv && fs.existsSync(realEnv)) return path.normalize(realEnv);
   const normalized = __dirname.replace(/\\/g, "/");
-  const geminiIdx = normalized.toLowerCase().lastIndexOf("/.gemini/");
+  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
   if (geminiIdx > 0) {
     const candidate = path.normalize(__dirname.slice(0, geminiIdx));
     if (fs.existsSync(candidate)) return candidate;
@@ -657,6 +659,7 @@ function resolvePluginLogoUrl(dir, manifest = {}) {
 }
 
 let lastInternalConfigWriteMs = 0;
+let lastInternalProfilesWriteMs = 0;
 let inflightLsRpcCount = 0;
 let lastLsRpcDoneMs = 0;
 const lsRpcTargetByInstance = new Map();
@@ -826,6 +829,7 @@ function writeJsonSafe(filePath, data) {
           }
         } catch (e) {}
       }
+      lastInternalProfilesWriteMs = Date.now();
     }
     if (filePath === CONFIG_FILE) {
       lastInternalConfigWriteMs = Date.now();
@@ -920,6 +924,10 @@ export function getLastInternalConfigWriteMs() {
 export function isInternalConfigWriteSettled(minSettleMs = 450) {
   if (inflightLsRpcCount > 0) return false;
   return (Date.now() - Math.max(lastInternalConfigWriteMs, lastLsRpcDoneMs)) > minSettleMs;
+}
+
+export function isInternalProfilesWriteSettled(minSettleMs = 600) {
+  return (Date.now() - lastInternalProfilesWriteMs) > minSettleMs;
 }
 
 export {

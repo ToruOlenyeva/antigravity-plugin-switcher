@@ -24,7 +24,8 @@ import {
   notifyLanguageServer,
   notifyMatchingInstancesLanguageServers,
   getLastInternalConfigWriteMs,
-  isInternalConfigWriteSettled
+  isInternalConfigWriteSettled,
+  isInternalProfilesWriteSettled
 } from "./ls-bridge.mjs";
 import {
   scanAntigravityProjects,
@@ -787,6 +788,7 @@ setInterval(async () => {
 // 事件驱动 1：监听 project-plugin-profiles.json 物理变更
 // 当在任意实例面板修改并保存项目配置时，另一实例后端毫秒级捕获，立即同步其面板 SSE 与运行态 LS
 async function handleExternalProfilesFileChange() {
+  if (!isInternalProfilesWriteSettled(600)) return;
   try {
     const curCtx = resolveSwitcherInstanceContext(PORT);
     const instKey = curCtx.instanceId || "main";
