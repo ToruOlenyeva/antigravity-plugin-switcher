@@ -125,8 +125,8 @@ Because the Antigravity host shares a single global <code>~/.gemini/config/confi
 - <b>Cross-Instance Millisecond Sync (<code>fs.watch(PROFILES_FILE)</code> + <code>notifyMatchingInstancesLanguageServers</code>) and Zero-Latency SSE Broadcast</b>:
   - Whenever a user modifies and saves a project's plugin switches in any instance panel, the backend immediately updates all matching instances' Language Servers via <code>notifyMatchingInstancesLanguageServers</code> and broadcasts the updated state in <code>0ms</code> via <code>fs.watch(PROFILES_FILE)</code> and <code>broadcastStateToAllFrontends(stateData)</code> over <code>GET /api/events</code> (Server-Sent Events);
   - External browsers on <code>http://localhost:8088</code> (main instance) and <code>http://localhost:8098</code> (isolated instance) subscribe via <code>new EventSource("/api/events")</code> to render their respective instance's active project alongside shared profile changes in real time, automatically syncing runtime plugins whenever an instance switches to a project like Chat.
-- <b>Frontend Dual-Observer Visibility Tracking and Collapsed SSE Disconnect for 0% CPU Sleep (<code>ResizeObserver</code> + <code>IntersectionObserver</code>)</b>:
-  - <code>isPanelActuallyVisible()</code> combines <code>ResizeObserver</code> with <code>IntersectionObserver</code> to detect true viewport visibility and occlusion: whenever the right Auxiliary Pane is collapsed, switched to another tab, or a conversation Sidecar iframe is hidden in the background, the frontend immediately pauses its <code>2.5s</code> polling timer and calls <code>close()</code> on <code>EventSource("/api/events")</code> so backend <code>sseClients.size</code> drops to zero for <code>0% CPU</code> deep sleep; once the panel becomes visible again, it immediately reconnects SSE and fires an active sync (<code>isPassive = false</code>) across both the built-in Sidecar and port <code>8088</code>.
+- <b><code>plugin://</code> Connection-Pool Isolation & Collapsed 0% CPU Sleep (<code>ResizeObserver</code> + <code>IntersectionObserver</code>)</b>:
+  - To prevent Electron `customScheme` `fetchWithoutFollowing` from leaking unclosed long-lived SSE handles and exhausting Chromium's 6-connection pool per origin (which stalls new project sidecar panes on an endless loading spinner), iframes loaded under `plugin://` never create `EventSource("/api/events")` and instead sync via visible-only `2.5s` lightweight polling (`0% CPU` sleep when hidden/collapsed), while external `http://localhost:8088` and `8098` views keep `0ms` SSE broadcasting.
 
 ## 4. HTTP API Specifications
 
@@ -162,7 +162,7 @@ All endpoints are served identically from both the host-assigned internal port a
 ### 4.1.1 Real-Time Dual-Output Event Stream (SSE)
 - <b>Route</b>: <code>GET /api/events</code>
 - <b>Content-Type</b>: <code>text/event-stream; charset=utf-8</code>
-- <b>Description</b>: Immediately pushes the cached <code>latestDualOutputState</code> upon connection and broadcasts the exact same <code>stateData</code> JSON frame (<code>data: {...}\n\n</code>) in <code>0ms</code> whenever the built-in Sidecar updates its state, enabling zero-latency mirroring on <code>http://localhost:8088</code>.
+- <b>Description</b>: Immediately pushes <code>latestDualOutputState</code> upon connection for <code>0ms</code> updates on standalone <code>8088</code> and <code>8098</code> browser tabs; requests hitting the dynamic host gateway port are defensively capped at <code>&lt;= 2</code> concurrent streams with a <code>20s</code> auto-close TTL.
 
 ### 4.2 Toggle Single Plugin State
 - <b>Route</b>: <code>POST /api/set-plugin-state</code>
@@ -208,7 +208,7 @@ All endpoints are served identically from both the host-assigned internal port a
   - Rewrites tab title values in <code>app_storage.json</code>.
 - <b>Response</b>: <code>{ "success": true, "lang": "en" }</code>
 
-### 4.7 Restart Sidecar Container
+### 4.7 Restart Sidecar Container & Orphan Watchdog
 - <b>Route</b>: <code>POST /api/restart-sidecar</code>
-- <b>Description</b>: Exits the process smoothly, triggering instant reactivation by host <code>restart_policy: always</code>.
+- <b>Description</b>: Exits smoothly for instant host reactivation under <code>restart_policy: always</code>; when invoked with <code>onlyStandalone=1</code>, it runs a live TCP check against <code>ANTIGRAVITY_LS_ADDRESS</code> (paired with the <code>5s</code> background LS watchdog) so stale orphaned instances whose host already exited release <code>8088</code>, <code>8098</code>, and legacy ports immediately.
 - <b>Response</b>: <code>{ "success": true, "message": "Sidecar restarting..." }</code>

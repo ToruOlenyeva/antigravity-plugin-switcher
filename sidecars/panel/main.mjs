@@ -1,4 +1,5 @@
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,10 +37,108 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT || 8088);
 
+let isHostLsReachable = true;
+let lsProbeFailCount = 0;
+
+function parseHostLsAddress() {
+  const raw = String(process.env.ANTIGRAVITY_LS_ADDRESS || "").trim();
+  if (!raw) return null;
+  const idx = raw.lastIndexOf(":");
+  if (idx <= 0) return null;
+  const host = raw.slice(0, idx).replace(/^\[|\]$/g, "").trim() || "127.0.0.1";
+  const port = Number(raw.slice(idx + 1));
+  if (!Number.isFinite(port) || port <= 0) return null;
+  return { host, port };
+}
+
+function probeHostLsTcpOnce(timeoutMs = 1500) {
+  const target = parseHostLsAddress();
+  if (!target) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    try {
+      const sock = net.createConnection({ host: target.host, port: target.port });
+      sock.setTimeout(timeoutMs);
+      sock.once("connect", () => {
+        try { sock.destroy(); } catch {}
+        done(true);
+      });
+      sock.once("timeout", () => {
+        try { sock.destroy(); } catch {}
+        done(false);
+      });
+      sock.once("error", () => {
+        try { sock.destroy(); } catch {}
+        done(false);
+      });
+    } catch {
+      done(false);
+    }
+  });
+}
+
+async function checkHostLanguageServerAlive() {
+  if (!process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) return true;
+  const ppid = Number(process.env.AGY_PARENT_LS_PID || process.ppid || 0);
+  if (ppid > 0) {
+    try {
+      process.kill(ppid, 0);
+    } catch (err) {
+      if (err && err.code === "ESRCH") {
+        process.exit(0);
+      }
+    }
+  }
+  if (parseHostLsAddress()) {
+    const alive = await probeHostLsTcpOnce(1200);
+    if (alive) {
+      isHostLsReachable = true;
+      lsProbeFailCount = 0;
+    } else if (process.uptime() > 15) {
+      lsProbeFailCount += 1;
+      if (lsProbeFailCount >= 2) {
+        isHostLsReachable = false;
+        process.exit(0);
+      }
+    }
+  }
+  return true;
+}
+
+if (process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+  setInterval(() => { checkHostLanguageServerAlive().catch(() => {}); }, 5000).unref();
+  try {
+    process.stdin.on("end", () => process.exit(0));
+    process.stdin.on("close", () => process.exit(0));
+  } catch {}
+}
+
 // 维护内置 Sidecar 最新状态快照与 SSE 实时双输出客户端集合（支持双实例克隆端口同源广播，仅当前项目识别按端口所属实例独立区分）
 const sseClients = new Set();
 const latestStateByInstance = new Map();
 const lastBroadcastSigByInstance = new Map();
+
+setInterval(() => {
+  if (sseClients.size === 0) return;
+  for (const clientRes of [...sseClients]) {
+    try {
+      if (clientRes.destroyed || clientRes.writableEnded) {
+        clientRes.__sseCleanup?.();
+        sseClients.delete(clientRes);
+      } else {
+        clientRes.write(": keepalive\n\n");
+      }
+    } catch {
+      clientRes.__sseCleanup?.();
+      sseClients.delete(clientRes);
+    }
+  }
+}, 25000).unref();
 
 function computeProfilesSignature(stateData) {
   if (!stateData || !stateData.profiles) return "";
@@ -129,13 +228,22 @@ async function requestHandler(req, res) {
   if (req.method === "POST" && pathname === "/api/restart-sidecar") {
     const onlyStandalone = url.searchParams.get("onlyStandalone") === "1";
     if (onlyStandalone && process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
+      const lsAlive = await probeHostLsTcpOnce(400);
+      if (lsAlive) {
+        isHostLsReachable = true;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, ignored: true, reason: "already_host_sidecar" }));
+        return;
+      }
+      isHostLsReachable = false;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, ignored: true, reason: "already_host_sidecar" }));
+      res.end(JSON.stringify({ success: true, evictedStaleParent: true }));
+      setTimeout(() => process.exit(0), 100);
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, message: "Sidecar restarting..." }));
-    setTimeout(() => process.exit(0), 200);
+    setTimeout(() => process.exit(0), onlyStandalone ? 150 : 200);
     return;
   }
 
@@ -239,27 +347,60 @@ async function requestHandler(req, res) {
     return;
   }
 
-  // 2.5 SSE 实时双输出流（将同源 stateData 0ms 实时推送给各实例端口活跃面板）
+  // 2.5 SSE 实时双输出流（仅 standalone 端口维持长连接；对 plugin:// LS 网关端口实施连接数封顶与短 TTL 熔断以防止 Chromium 6 连接池耗尽）
   if (req.method === "GET" && pathname === "/api/events") {
     const localPort = Number(req.socket?.localPort || PORT);
     const reqCtx = resolveSwitcherInstanceContext(localPort);
+    const isGatewayPort = Boolean(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT && localPort === PORT && localPort !== 8088 && localPort !== 8098);
     res.__localPort = localPort;
+
+    if (isGatewayPort) {
+      const gatewayClients = [...sseClients].filter((c) => c.__localPort === PORT);
+      while (gatewayClients.length >= 2) {
+        const oldest = gatewayClients.shift();
+        if (oldest) {
+          oldest.__sseCleanup?.();
+          sseClients.delete(oldest);
+          try { oldest.end(); } catch {}
+        }
+      }
+    }
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-store, no-cache, must-revalidate",
-      "Connection": "keep-alive"
+      "Connection": isGatewayPort ? "close" : "keep-alive"
     });
-    res.write(": connected\n\n");
+    res.write(isGatewayPort ? "retry: 3000\n: connected\n\n" : ": connected\n\n");
     const cachedState = latestStateByInstance.get(reqCtx.instanceId || "main");
     if (cachedState) {
       try {
         res.write(`data: ${JSON.stringify(cachedState)}\n\n`);
       } catch (e) {}
     }
-    sseClients.add(res);
-    req.on("close", () => {
+
+    let cleaned = false;
+    let ttlTimer = null;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (ttlTimer) clearTimeout(ttlTimer);
       sseClients.delete(res);
-    });
+    };
+    res.__sseCleanup = cleanup;
+    sseClients.add(res);
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+    req.socket?.on("close", cleanup);
+
+    if (isGatewayPort) {
+      ttlTimer = setTimeout(() => {
+        cleanup();
+        try { res.end(); } catch {}
+      }, 20000);
+      ttlTimer.unref();
+    }
     return;
   }
 
@@ -652,7 +793,13 @@ try {
   scanAntigravityProjects(selfInstanceCtx);
 } catch (e) {}
 
-const server = http.createServer(requestHandler);
+function configureSidecarHttpServer(srv) {
+  srv.keepAliveTimeout = 4000;
+  srv.headersTimeout = 6000;
+  return srv;
+}
+
+const server = configureSidecarHttpServer(http.createServer(requestHandler));
 server.on("error", (err) => {
   console.log(`[PluginSwitcher Sidecar] Primary port ${PORT} listener notice: ${err.message}`);
 });
@@ -667,7 +814,7 @@ const boundPorts = new Set([PORT]);
 function tryBindClonePort(clonePort) {
   if (PORT === clonePort || boundPorts.has(clonePort)) return;
   let retryCount = 0;
-  const cloneServer = http.createServer(requestHandler);
+  const cloneServer = configureSidecarHttpServer(http.createServer(requestHandler));
 
   const attemptListen = () => {
     try {
@@ -688,12 +835,12 @@ function tryBindClonePort(clonePort) {
             port: clonePort,
             path: "/api/restart-sidecar?onlyStandalone=1",
             method: "POST",
-            timeout: 500
+            timeout: 800
           }, () => {});
           evictReq.on("error", () => {});
           evictReq.end();
         } catch (e) {}
-        setTimeout(attemptListen, 350);
+        setTimeout(attemptListen, 600);
       } else {
         try { cloneServer.close(); } catch (e) {}
       }
@@ -712,12 +859,23 @@ if (selfInstanceCtx.isIsolatedInstance) {
   tryBindClonePort(8098);
 }
 
-function bindAdditionalSidecarPorts() {
+let lastObservedAppStorageMtime = 0;
+function bindAdditionalSidecarPorts(forceScan = false) {
   try {
     const curCtx = resolveSwitcherInstanceContext(PORT);
+    const appStoragePath = curCtx.appStorageFile || APP_STORAGE_FILE;
+    let currentMtime = 0;
+    try {
+      if (fs.existsSync(appStoragePath)) {
+        currentMtime = Math.floor(fs.statSync(appStoragePath).mtimeMs);
+      }
+    } catch {}
+    if (!forceScan && currentMtime === lastObservedAppStorageMtime && boundPorts.size > 1) return;
+    lastObservedAppStorageMtime = currentMtime;
+
     const candidatePorts = new Set();
     // 严格仅扫描当前实例自身的 app_storage.json，绝不跨实例抢绑另一实例正在使用的 Sidecar 端口
-    const appStorage = readJsonSafe(curCtx.appStorageFile || APP_STORAGE_FILE, {});
+    const appStorage = readJsonSafe(appStoragePath, {});
     const rawText = JSON.stringify(appStorage || {});
     const regex = /plugin-switcher--panel-(\d+)/g;
     let match;
@@ -744,7 +902,7 @@ function bindAdditionalSidecarPorts() {
       if (boundPorts.has(p) || otherInstancePorts.has(p)) continue;
       boundPorts.add(p);
       try {
-        const legacyServer = http.createServer(requestHandler);
+        const legacyServer = configureSidecarHttpServer(http.createServer(requestHandler));
         legacyServer.on("error", () => {
           boundPorts.delete(p);
         });
@@ -758,8 +916,9 @@ function bindAdditionalSidecarPorts() {
   } catch (e) {}
 }
 
-bindAdditionalSidecarPorts();
-setTimeout(bindAdditionalSidecarPorts, 4000);
+bindAdditionalSidecarPorts(true);
+setTimeout(() => bindAdditionalSidecarPorts(true), 4000);
+setInterval(() => bindAdditionalSidecarPorts(false), 30000).unref();
 
 // 仅当存在活跃前端面板连接（sseClients.size > 0）时低频（3500ms）检测各实例窗口路由跃变
 const lastObservedRouteSigByInst = new Map();

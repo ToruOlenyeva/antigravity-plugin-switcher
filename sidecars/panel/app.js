@@ -17,7 +17,9 @@
     let resetConfirmTimer = null;
     let isViewportIntersecting = true;
     const clientInstanceId = "cid_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
+    const isPluginCustomScheme = typeof window !== "undefined" && window.location?.protocol === "plugin:";
     const isEmbeddedSidecar = typeof window !== "undefined" && window.location.port !== "8088" && window.location.port !== "8098" && Boolean(
+      isPluginCustomScheme ||
       window.sidecar ||
       new URLSearchParams(window.location.search).get("token")
     );
@@ -1233,9 +1235,21 @@
         // 即时渲染卡片
         onSelectProject();
 
-        // 按需管理 SSE 实时连接：仅当面板真实可见时才维持 /api/events 连接；面板折叠或隐藏时立即断开，让后端 sseClients.size 归零进入 0% CPU 深度休眠
+        // 按需管理 SSE 实时连接：仅在非 plugin:// 协议的独立浏览器页面维持 /api/events 长连接；plugin:// 嵌套面板严禁持有长 SSE 流（避免 Electron customScheme 代理漏连接耗尽 6 连接池），完全由可见态轻量轮询兜底同步
+        function closeSseConnection() {
+          if (window.__sseSource) {
+            try {
+              window.__sseSource.close();
+            } catch (e) {}
+            window.__sseSource = null;
+          }
+        }
+
         function ensureSseConnected() {
-          if (!isPanelActuallyVisible()) return;
+          if (!isPanelActuallyVisible() || isPluginCustomScheme) {
+            closeSseConnection();
+            return;
+          }
           if (!window.__sseSource && typeof window.EventSource === "function") {
             try {
               const es = new EventSource("/api/events");
@@ -1251,16 +1265,7 @@
           }
         }
 
-        function closeSseConnection() {
-          if (window.__sseSource) {
-            try {
-              window.__sseSource.close();
-            } catch (e) {}
-            window.__sseSource = null;
-          }
-        }
-
-        if (isPanelActuallyVisible()) {
+        if (isPanelActuallyVisible() && !isPluginCustomScheme) {
           ensureSseConnected();
         } else {
           closeSseConnection();
@@ -1269,6 +1274,8 @@
         // 挂载事件监听器与轻量安全心跳（跃变门禁守门：真切项目瞬间联动，编辑其他项目绝对不打断）
         if (!window.__listenersBound) {
           window.__listenersBound = true;
+          window.addEventListener("pagehide", closeSseConnection);
+          window.addEventListener("beforeunload", closeSseConnection);
           window.addEventListener("focus", () => {
             ensureSseConnected();
             syncActiveProjectSilently("", "", !isEmbeddedSidecar);

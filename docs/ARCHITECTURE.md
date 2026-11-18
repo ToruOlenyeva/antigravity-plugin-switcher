@@ -125,8 +125,8 @@ plugin-switcher/
 - <b>跨实例修改毫秒级双向同步（<code>fs.watch(PROFILES_FILE)</code> + <code>notifyMatchingInstancesLanguageServers</code>）与 SSE 零延迟广播</b>：
   - 每当用户在任一实例面板修改任意项目的插件开关并保存时，后端立即通过 <code>notifyMatchingInstancesLanguageServers</code> 同步所有正处于该项目下的实例 Language Server，并通过 <code>fs.watch(PROFILES_FILE)</code> 与 <code>broadcastStateToAllFrontends(stateData)</code> 经由 <code>GET /api/events</code> (Server-Sent Events) <code>0ms</code> 实时推送给所有实例面板与外部 <code>8088</code> / <code>8098</code> 小窗；
   - 外部浏览器 <code>http://localhost:8088</code>（主实例）与 <code>http://localhost:8098</code>（多开实例）通过 <code>new EventSource("/api/events")</code> 实时接收各自实例视角下的最新状态数据包并立即更新 DOM，同时在某实例切换到「聊天」等项目时自动将该实例运行态插件同步为对应项目预设。
-- <b>前端双观察者可见性感知与折叠态 SSE 断连 0% CPU 休眠（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
-  - 前端在 <code>isPanelActuallyVisible()</code> 中联合使用 <code>ResizeObserver</code> 与 <code>IntersectionObserver</code> 实时检测视口遮挡与真实可见性：当右侧面板被折叠收起、切至其他辅助栏标签页或旧对话 Sidecar iframe 退入后台不可见时，前端立即冻结 <code>2.5s</code> 定时轮询并主动调用 <code>close()</code> 断开 <code>EventSource("/api/events")</code> 连接，使后端 <code>sseClients.size</code> 归零进入 <code>0% CPU</code> 深度休眠；当面板重新展开可见时，立即重连 SSE 并触发一次主动同步（<code>isPassive = false</code>），瞬间驱动内置面板与 <code>8088</code> 同步翻转。
+- <b><code>plugin://</code> 长连接防耗尽隔离与折叠态 0% CPU 休眠（<code>ResizeObserver</code> + <code>IntersectionObserver</code>）</b>：
+  - 为防止 Electron <code>customScheme</code> `fetchWithoutFollowing` 在释放头后无法回收长 SSE 句柄从而耗尽 Chromium 同源 6 连接池（导致新建项目侧边栏永久转圈），<code>plugin://</code> 协议下的嵌套面板严禁创建 <code>EventSource("/api/events")</code>，仅在 <code>isPanelActuallyVisible()</code> 为真时依托 <code>2.5s</code> 可见态轻量轮询（隐藏/折叠态立即冻结实现 <code>0% CPU</code> 休眠）；外部 <code>http://localhost:8088</code> / <code>8098</code> 页面仍保留 <code>0ms</code> SSE 实时推送。
 
 ## 4. HTTP API 接口规范
 
@@ -162,7 +162,7 @@ plugin-switcher/
 ### 4.1.1 实时状态双输出事件流（SSE）
 - <b>路径</b>：<code>GET /api/events</code>
 - <b>响应类型</b>：<code>text/event-stream; charset=utf-8</code>
-- <b>说明</b>：连接建立时立即推送当前最新的 <code>latestDualOutputState</code>，并在内置 Sidecar 每次完成状态计算后 <code>0ms</code> 广播同一份 <code>stateData</code> JSON 数据帧（<code>data: {...}\n\n</code>），供 <code>http://localhost:8088</code> 与多端面板零延迟同步。
+- <b>说明</b>：连接建立时立即推送当前最新的 <code>latestDualOutputState</code>，为独立浏览器 <code>8088</code> / <code>8098</code> 窗口提供 <code>0ms</code> 广播；对通过 <code>ANTIGRAVITY_SIDECAR_WEB_PORT</code> 网关进入的请求强制限制并发 <code>&lt;= 2</code> 且 <code>20s</code> 自动收口防漏。
 
 ### 4.2 切换单个插件状态
 - <b>路径</b>：<code>POST /api/set-plugin-state</code>
@@ -208,7 +208,7 @@ plugin-switcher/
   - 动态重写 <code>app_storage.json</code> 中所有对应 Tab 的标题。
 - <b>返回格式</b>：<code>{ "success": true, "lang": "en" }</code>
 
-### 4.7 重启 Sidecar 容器
+### 4.7 重启 Sidecar 容器与僵尸自清理
 - <b>路径</b>：<code>POST /api/restart-sidecar</code>
-- <b>说明</b>：触发微服务平滑终止，由宿主 <code>restart_policy: always</code> 毫秒级重拉。
+- <b>说明</b>：触发微服务平滑终止并由宿主 <code>restart_policy: always</code> 重拉；当携带 <code>onlyStandalone=1</code> 时，即使设置过 <code>ANTIGRAVITY_SIDECAR_WEB_PORT</code> 也会现网 TCP 探活 <code>ANTIGRAVITY_LS_ADDRESS</code>（联动后台 <code>5s</code> 看门狗），确认原宿主已退出后立即自撤以让出 <code>8088</code> / <code>8098</code> 及历史会话端口。
 - <b>返回格式</b>：<code>{ "success": true, "message": "Sidecar restarting..." }</code>
